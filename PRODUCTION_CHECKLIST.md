@@ -1,0 +1,28 @@
+# Production go-live checklist
+
+- [ ] Railway Pro workspace/project selected
+- [ ] Production environment isolated from staging
+- [ ] Postgres provisioned
+- [ ] Daily database backup enabled
+- [ ] PITR decision documented
+- [ ] LiteLLM has no permanent public domain
+- [ ] Portal has `ai.jsanconsulting.com`
+- [ ] Railway TLS active
+- [ ] Strong registration access code
+- [ ] Strong JWT secret
+- [ ] Strong key-encryption secret
+- [ ] LiteLLM master key generated
+- [ ] LiteLLM salt key generated and archived securely
+- [ ] No secrets committed to Git
+- [ ] Portal healthcheck passes
+- [ ] LiteLLM readiness healthcheck passes
+- [ ] `auto`, `code`, `think`, `fast` tested
+- [ ] `/v1/models` works with developer virtual key
+- [ ] Codex tested
+- [ ] Claude Code tested
+- [ ] 20-user cap tested
+- [ ] Key rotation tested
+- [ ] Railway spend alerts configured
+- [ ] Resource/replica limits reviewed
+- [ ] Provider billing/quota alerts configured
+- [ ] Recovery owner and rollback process assigned
