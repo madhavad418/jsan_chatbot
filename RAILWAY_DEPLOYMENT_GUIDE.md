@@ -72,3 +72,18 @@ Then send one request through each logical mode.
 
 ## 10. Release discipline
 Use a Git repository. Protect `main`; deploy production from reviewed commits/tags. Keep provider secrets only in Railway Variables. Do not commit `.env` files. Use a staging environment for gateway upgrades/provider changes before production.
+
+## Appendix — preview mode, before Postgres exists
+
+Accounts, per-developer keys and saved history all live in the database, so the portal cannot sign anyone in until step 2 is done. To demo or test the app before that, set `AUTH_DISABLED=true` on `portal`:
+
+- The sign-in screen is skipped and every visitor shares one anonymous session.
+- Chat works, using the master key server-side. It is never sent to a browser.
+- Conversations are held in the service's memory only, and are lost on restart or redeploy.
+- Tools and Usage explain that keys and spend need the database, rather than failing.
+- `/api/health` reports `previewMode: true` and judges health on the gateway alone, so Railway does not restart a service for the missing database it was told to run without.
+- `DATABASE_URL`, `REGISTRATION_ACCESS_CODE`, `JWT_SECRET` and `KEY_ENCRYPTION_SECRET` are unused; `LITELLM_MASTER_KEY` is still required.
+
+The developer API at `/v1` is unaffected: it still forwards the caller's `Authorization` header to LiteLLM, which rejects anything that is not a valid key. Preview mode opens the browser chat, not the gateway.
+
+Treat it as a closed test. There is no seat cap, no per-developer budget and no audit trail of who asked what — one shared session spending the master key's budget. Leave `portal` without a public domain while it is on, and delete the variable before step 5. Removing it restores sign-in exactly as documented above; no code change is involved and nothing in the database is touched.
