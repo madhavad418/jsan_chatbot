@@ -1,0 +1,9 @@
+{
+  "name":"jsan-dev-ai",
+  "version":"5.0.0",
+  "private":true,
+  "scripts":{
+    "build:web":"npm --prefix web install && npm --prefix web run build",
+    "check:api":"npm --prefix api install && npm --prefix api run check"
+  }
+}
