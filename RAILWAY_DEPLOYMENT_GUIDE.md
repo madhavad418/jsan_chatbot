@@ -30,13 +30,13 @@ Create the CNAME/TXT DNS records Railway gives you. Railway provisions and renew
 Do not expose PostgreSQL or LiteLLM publicly for normal operation.
 
 ## 6. Provider onboarding
-For first production smoke test, configure only four logical groups:
-- `auto` — Gemini
-- `code` — Kimi or Claude
-- `think` — Claude or OpenAI
-- `fast` — Groq
+All four logical groups run on OpenRouter free-tier models, so one OpenRouter key is the only provider credential needed:
+- `auto` — Nemotron 3 Super 120B
+- `code` — Poolside Laguna S 2.1
+- `think` — Nemotron 3 Ultra 550B
+- `fast` — Nemotron 3.5 Lightning
 
-After validation, add Cerebras, OpenRouter and NVIDIA as secondary deployments/fallbacks.
+The free tier is rate limited per account rather than per developer, so validate throughput against 20 seats before relying on it. Moving a mode to a paid model or a direct provider key is a one-line change in `litellm/config.yaml`.
 
 Models can be stored in LiteLLM's DB (`STORE_MODEL_IN_DB=True`). If you need the LiteLLM Admin UI during maintenance, expose it only temporarily or put it behind your organization's access control; remove public exposure when finished. Never share the master key with developers.
 

@@ -9,36 +9,45 @@
 # instead of one per provider. To move a mode onto a direct provider key
 # later, change its `model` and `api_key` here; nothing else changes.
 #
+# Every model below is on OpenRouter's free tier - the `:free` suffix is
+# what selects it, and a model without that suffix is billed. A key is
+# still required: free means no per-token charge, not no account.
+#
+# The free tier is rate limited per account, not per developer, and the
+# ceiling is far below what 20 seats at DEVELOPER_RPM_LIMIT would ask for.
+# Treat this roster as pilot/evaluation configuration.
+#
 # Adding a SECOND entry with the same model_name load-balances across both
 # (routing_strategy below) — that is how to add redundancy per mode.
 
 model_list:
-  # Everyday work. Large context, low cost.
+  # Everyday work. 120B hybrid MoE activating 12B, 262k context.
   - model_name: auto
     litellm_params:
-      model: openrouter/google/gemini-3.7-flash
+      model: openrouter/nvidia/nemotron-3-super-120b-a12b:free
       api_key: os.environ/OPENROUTER_API_KEY
       max_tokens: 8000
 
-  # Implementation, debugging, code review.
+  # Implementation, debugging, code review. Poolside's coding agent model,
+  # 118B total / 8B active, 262k context.
   - model_name: code
     litellm_params:
-      model: openrouter/anthropic/claude-sonnet-5
+      model: openrouter/poolside/laguna-s-2.1:free
       api_key: os.environ/OPENROUTER_API_KEY
       max_tokens: 8000
 
-  # Architecture and deeper reasoning. Most expensive per token —
-  # keep DEVELOPER_MONTHLY_BUDGET_USD set on the portal.
+  # Architecture and deeper reasoning. 550B frontier-reasoning MoE
+  # activating 55B, 1M context. Slowest of the four, as before.
   - model_name: think
     litellm_params:
-      model: openrouter/anthropic/claude-opus-5
+      model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
       api_key: os.environ/OPENROUTER_API_KEY
       max_tokens: 8000
 
-  # Quick answers and small tasks.
+  # Quick answers and small tasks. 3B active of 30B, built for throughput.
   - model_name: fast
     litellm_params:
-      model: openrouter/meta-llama/llama-3.3-70b-instruct
+      model: openrouter/nvidia/nemotron-3.5-lightning:free
       api_key: os.environ/OPENROUTER_API_KEY
       max_tokens: 8000
 
