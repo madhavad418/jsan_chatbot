@@ -5,3 +5,9 @@ portal/web/dist/
 .DS_Store
 *.pem
 *.key
+
+# SQLite database files
+portal/api/data/
+*.db
+*.db-wal
+*.db-shm
