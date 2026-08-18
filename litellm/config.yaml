@@ -1,7 +1,7 @@
 # Model routing for the JSAN Dev AI gateway.
 #
 # The portal offers four logical modes and sends the mode name as the model
-# name (see DEV_MODELS in portal/api/src/server.js). The model_name values
+# name (see DEV_MODELS in portal/backend/src/server.js). The model_name values
 # below MUST stay exactly `auto`, `code`, `think` and `fast` — developer
 # virtual keys are scoped to those four names at issue time.
 #

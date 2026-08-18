@@ -4,13 +4,10 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "check": "node --check src/server.js",
-    "db:init": "node src/db/cli.js init",
-    "db:status": "node src/db/cli.js status",
-    "db:verify": "node src/db/verify.js",
-    "db:reset": "node src/db/cli.js reset"
+    "check": "node --check src/server.js"
   },
   "dependencies": {
+    "@jsan/database": "file:../database",
     "bcryptjs": "^3.0.2",
     "cookie-parser": "^1.4.7",
     "dotenv": "^17.2.1",

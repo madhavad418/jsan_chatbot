@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 // JSAN Dev AI — SQLite database CLI.
 //
-//   node src/db/cli.js init     create (or upgrade) the database file
-//   node src/db/cli.js status   report tables, row counts and integrity
-//   node src/db/cli.js reset    delete and recreate it (needs --force)
+// Run from portal/database as `npm run init` / `status` / `reset`, or from
+// portal as `npm run db:init` and friends.
+//
+//   node src/cli.js init     create (or upgrade) the database file
+//   node src/cli.js status   report tables, row counts and integrity
+//   node src/cli.js reset    delete and recreate it (needs --force)
 
 import fs from 'node:fs';
 import { connect, openDatabase, initSchema, databasePath, checkIntegrity } from './sqlite.js';

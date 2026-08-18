@@ -5,7 +5,7 @@
 # file applies.
 #
 # The portal is deliberately NOT a service here - run it on the host with
-# `npm start` from portal/api so restarts stay instant. portal/.env already
+# `npm start` from portal/backend so restarts stay instant. portal/.env already
 # points at the two ports published below.
 #
 #   docker compose -f docker-compose.local.yml up -d

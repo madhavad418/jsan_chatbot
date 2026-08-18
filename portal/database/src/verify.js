@@ -5,7 +5,7 @@
 // constraints the application relies on, so a schema change that quietly
 // breaks a cascade or a uniqueness rule fails here instead of in production.
 //
-//   node src/db/verify.js
+//   npm run verify        (from portal/database)
 
 import assert from 'node:assert';
 import crypto from 'node:crypto';

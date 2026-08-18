@@ -10,13 +10,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const API_ROOT = path.resolve(__dirname, '../..');
+const PACKAGE_ROOT = path.resolve(__dirname, '..');
 const SCHEMA_PATH = path.join(__dirname, 'schema.sql');
 
 /** Absolute path of the database file (override with SQLITE_PATH). */
 export function databasePath() {
   const configured = String(process.env.SQLITE_PATH || '').trim();
-  return path.resolve(API_ROOT, configured || 'data/jsan.db');
+  return path.resolve(PACKAGE_ROOT, configured || 'data/jsan.db');
 }
 
 /** ISO-8601 UTC timestamp in the exact format the schema defaults produce. */

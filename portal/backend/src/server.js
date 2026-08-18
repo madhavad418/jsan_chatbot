@@ -12,8 +12,8 @@ import { Readable } from 'stream';
 
 // Resolve .env from this file's location rather than the working directory, so
 // the server loads the same configuration whether it is started from portal/,
-// from portal/api/ (`npm start`) or from /app in the container. Earlier paths
-// win; missing files are skipped, which is what happens on Railway where the
+// from portal/backend/ (`npm start`) or from /app in the container. Earlier
+// paths win; missing files are skipped, as happens on Railway where the
 // platform injects the variables directly.
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({
@@ -450,7 +450,7 @@ app.get('/api/tools/config', auth, (_req, res) => {
   });
 });
 
-const staticDir = path.resolve(__dirname, '../../web/dist');
+const staticDir = path.resolve(__dirname, '../../frontend/dist');
 // Public developer API edge. LiteLLM itself stays private on Railway.
 // This preserves streaming and lets Codex / Claude Code / SDKs use one JSAN domain.
 app.use('/v1', async (req, res) => {

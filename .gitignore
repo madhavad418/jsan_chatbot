@@ -1,13 +1,13 @@
 .env
 *.log
 node_modules/
-portal/web/dist/
+portal/frontend/dist/
 .DS_Store
 *.pem
 *.key
 
 # SQLite database files
-portal/api/data/
+portal/database/data/
 *.db
 *.db-wal
 *.db-shm
