@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
@@ -9,6 +9,17 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Readable } from 'stream';
+
+// Resolve .env from this file's location rather than the working directory, so
+// the server loads the same configuration whether it is started from portal/,
+// from portal/api/ (`npm start`) or from /app in the container. Earlier paths
+// win; missing files are skipped, which is what happens on Railway where the
+// platform injects the variables directly.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({
+  path: [path.resolve(__dirname, '../.env'), path.resolve(__dirname, '../../.env')],
+  quiet: true
+});
 
 const { Pool } = pg;
 const app = express();
@@ -439,7 +450,6 @@ app.get('/api/tools/config', auth, (_req, res) => {
   });
 });
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const staticDir = path.resolve(__dirname, '../../web/dist');
 // Public developer API edge. LiteLLM itself stays private on Railway.
 // This preserves streaming and lets Codex / Claude Code / SDKs use one JSAN domain.
