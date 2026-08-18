@@ -6,7 +6,7 @@ Production-oriented Railway package for the 20-seat JSAN developer AI gateway.
 
 1. `portal` — JSAN Dev AI web UI + API + public `/v1` gateway edge.
 2. `litellm` — private LiteLLM gateway; no public domain required.
-3. `Postgres` — Railway PostgreSQL for portal + LiteLLM persistence.
+3. `Postgres` — Railway PostgreSQL for LiteLLM persistence. The portal keeps its own state in SQLite on an attached volume.
 
 ## Layout
 
@@ -14,7 +14,7 @@ Production-oriented Railway package for the 20-seat JSAN developer AI gateway.
 portal/            the public service - one image serving all three
 ├── frontend/      Vite + React UI
 ├── backend/       Express API and the /v1 gateway edge
-└── database/      @jsan/database - SQLite store (not yet wired into backend)
+└── database/      @jsan/database - SQLite store the backend reads and writes
 litellm/           private LiteLLM gateway config
 scripts/           local Postgres init
 ```

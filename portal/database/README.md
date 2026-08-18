@@ -65,7 +65,9 @@ SQLite allows one writer at a time. That is ample for a 20-seat portal, but the
 database has to live on a disk local to the process — on Railway that requires
 an attached volume, since the container filesystem is ephemeral.
 
-## Status
+## Deployment
 
-Built and tested, but nothing reads it yet: `backend/src/server.js` still talks
-to PostgreSQL through `pg`.
+SQLite allows one writer on one node, so the backend must run as a single
+replica against a disk that survives restarts. On Railway that means an attached
+volume with `SQLITE_PATH` pointing into it; the container filesystem is
+ephemeral. Postgres remains in the stack for LiteLLM's own persistence.

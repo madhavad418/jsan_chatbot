@@ -2,9 +2,13 @@
 
 - [ ] Railway Pro workspace/project selected
 - [ ] Production environment isolated from staging
-- [ ] Postgres provisioned
+- [ ] Postgres provisioned (LiteLLM only)
 - [ ] Daily database backup enabled
 - [ ] PITR decision documented
+- [ ] Portal volume attached and mounted at /data
+- [ ] SQLITE_PATH points at the volume
+- [ ] Portal volume backup/copy routine agreed
+- [ ] Portal replica count pinned to 1
 - [ ] LiteLLM has no permanent public domain
 - [ ] Portal has `ai.jsanconsulting.com`
 - [ ] Railway TLS active

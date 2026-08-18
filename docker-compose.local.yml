@@ -4,9 +4,11 @@
 # and LiteLLM are managed services on the private network and none of this
 # file applies.
 #
+# Postgres is here for LiteLLM alone. The portal keeps its own state in SQLite
+# at portal/database/data/jsan.db and needs nothing from this file.
+#
 # The portal is deliberately NOT a service here - run it on the host with
-# `npm start` from portal/backend so restarts stay instant. portal/.env already
-# points at the two ports published below.
+# `npm start` from portal/backend so restarts stay instant.
 #
 #   docker compose -f docker-compose.local.yml up -d
 
@@ -16,14 +18,13 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: jsan_dev_ai
+      POSTGRES_DB: litellm
     ports:
       - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./scripts/init-litellm-db.sql:/docker-entrypoint-initdb.d/init-litellm-db.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d jsan_dev_ai"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d litellm"]
       interval: 3s
       timeout: 3s
       retries: 20

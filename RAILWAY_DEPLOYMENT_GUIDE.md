@@ -4,7 +4,7 @@
 Create a Railway **Pro** project named `JSAN Dev AI` and a `production` environment. Keep staging separate if you add it later.
 
 ## 2. Add PostgreSQL
-Add Railway PostgreSQL from `+ New`. Keep it private; the application services use its reference variable. Enable daily backups before inviting users; enable PITR when this becomes business-critical.
+Add Railway PostgreSQL from `+ New`. It serves **LiteLLM only** — the portal keeps its own state in SQLite. Keep it private; LiteLLM uses its reference variable. Enable daily backups before inviting users; enable PITR when this becomes business-critical.
 
 ## 3. Deploy LiteLLM
 Create a service named exactly `litellm` from this repository and set **Root Directory** to `/litellm`.
@@ -16,7 +16,9 @@ Do **not** generate a public domain for LiteLLM. Its Railway healthcheck is `/he
 ## 4. Deploy the JSAN portal
 Create a service named `portal` from the same repository and set **Root Directory** to `/portal`.
 
-Add variables from `portal/.env.railway.example`. Railway reference variables connect it privately to Postgres and LiteLLM.
+Attach a **volume** to the service and mount it at `/data`, then set `SQLITE_PATH=/data/jsan.db`. The container filesystem is ephemeral, so without a volume every deploy starts from an empty database and all accounts are lost.
+
+Add variables from `portal/.env.railway.example`. Railway reference variables connect it privately to LiteLLM.
 
 The portal listens on Railway's injected `PORT`. Healthcheck: `/api/health`.
 
@@ -52,7 +54,7 @@ Only then invite the remaining developers. The portal stops new registration at 
 
 ## 8. Production settings
 For the 20-user pilot:
-- Portal: 1 replica initially; 0.5–1 vCPU / 512 MB–1 GB is normally enough.
+- Portal: **exactly 1 replica** — SQLite allows a single writer on a single node, so a second replica would run against its own copy of the database. Scale up rather than out, or move to Postgres first. 0.5–1 vCPU / 512 MB–1 GB is normally enough.
 - LiteLLM: 1 replica initially; 1 vCPU / 1–2 GB.
 - PostgreSQL: Railway default, with backups enabled.
 - Restart policy: On Failure.

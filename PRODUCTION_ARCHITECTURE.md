@@ -21,13 +21,14 @@ Developers / Browser / Codex / Claude Code
                                                     |       OpenRouter
                                                     +------- NVIDIA
 
-Portal ---------------- private network ---------------- Postgres
+Portal ---------------- attached volume ---------------- SQLite
 LiteLLM --------------- private network ---------------- Postgres
 ```
 
 ## Trust boundaries
 - Public: portal only.
 - Private: LiteLLM and PostgreSQL.
+- Portal state: SQLite on a volume only that service can reach, never over the network.
 - Developer credentials: LiteLLM virtual keys.
 - Provider credentials: LiteLLM/Railway secrets only.
 - Owner credential: LiteLLM master key; never issued to developers.

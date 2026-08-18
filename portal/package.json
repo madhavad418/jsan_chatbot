@@ -5,9 +5,9 @@
   "scripts": {
     "build:frontend": "npm --prefix frontend install && npm --prefix frontend run build",
     "check:backend": "npm --prefix backend install && npm --prefix backend run check",
-    "db:init": "npm --prefix database run init",
-    "db:status": "npm --prefix database run status",
-    "db:verify": "npm --prefix database run verify",
-    "db:reset": "npm --prefix database run reset"
+    "db:init": "node database/src/cli.js init",
+    "db:status": "node database/src/cli.js status",
+    "db:verify": "node database/src/verify.js",
+    "db:reset": "node database/src/cli.js reset"
   }
 }
