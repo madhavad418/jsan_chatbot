@@ -33,11 +33,56 @@ const REGISTRATION_ACCESS_CODE = requireSecret('REGISTRATION_ACCESS_CODE');
 const ALLOWED_EMAIL_DOMAIN = String(process.env.ALLOWED_EMAIL_DOMAIN || '').trim().toLowerCase();
 const LITELLM_BASE_URL = String(process.env.LITELLM_BASE_URL || 'http://litellm:4000').replace(/\/$/, '');
 const LITELLM_MASTER_KEY = requireSecret('LITELLM_MASTER_KEY');
+// The four modes a developer picks in the composer.
 const DEV_MODELS = ['auto', 'code', 'think', 'fast'];
-const SYSTEM_PROMPT = `You are JSAN Dev AI, a senior software engineering copilot. Be concise, production-minded and practical. For code work, prioritize correctness, security, maintainability and verifiable next steps. State important assumptions. Never pretend to have executed or inspected something you have not. Prefer focused changes over unnecessary rewrites.`;
+// Not a fifth mode: the four above are text-in, text-out and cannot be handed a
+// screenshot at all, so the portal switches to this by itself for any question
+// that carries an image. Developers never select it, but their virtual keys
+// have to allow it, which is what KEY_MODELS is for.
+const VISION_MODEL = 'see';
+const KEY_MODELS = [...DEV_MODELS, VISION_MODEL];
+const MAX_IMAGES = 4;
+const MAX_IMAGE_BYTES = 1_500_000;
+const ALLOWED_IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+// How far back a conversation keeps resending its images. An image costs far
+// more context than the words around it and the free vision models have the
+// smallest windows on the roster, so only the last few messages carry theirs -
+// which also lets a conversation drop back to the chosen text mode once the
+// screenshots stop being the subject.
+const IMAGE_LOOKBACK_MESSAGES = 6;
+// Answer shape.
+//
+// The earlier version of this asked the model to "state important assumptions",
+// which it read as a standing instruction: every reply came back with an
+// assumptions block, a list of clarifying questions and an offer of further
+// help, whatever was asked. A two-word question was answered in 1,900
+// characters. What follows is written to stop that padding specifically.
+const SYSTEM_PROMPT = `You are JSAN Dev AI, a senior software engineering copilot.
+
+Answer the question that was asked, at the length it deserves - a one-line question gets a one-line answer. Open with the answer itself: no preamble, no restating the question back, no announcing what you are about to do.
+
+Never pad a reply with sections nobody asked for. No standing assumptions block, no list of clarifying questions attached to an answer you have already given, no closing offer of further help. Where a single assumption genuinely changes the answer, say it in one sentence at the point it matters. Where a request is broad or ambiguous, answer its most likely reading rather than asking which one was meant; ask a single question only when no useful answer is possible without it.
+
+For code work, prioritize correctness, security, maintainability and verifiable next steps. Never claim to have run or inspected something you have not. Prefer focused changes over unnecessary rewrites.`;
 const DEV_MONTHLY_BUDGET = Number(process.env.DEVELOPER_MONTHLY_BUDGET_USD || 0);
 const DEV_RPM_LIMIT = Number(process.env.DEVELOPER_RPM_LIMIT || 0);
 const DEV_TPM_LIMIT = Number(process.env.DEVELOPER_TPM_LIMIT || 0);
+
+// Chat streaming budgets.
+//
+// A single wall-clock deadline cannot serve both cases here: a real engineering
+// answer from a reasoning model runs for minutes, while a gateway that has
+// stopped responding must not hold the browser open. So the deadline that
+// matters is the idle one — silence on the wire — and the total is only a
+// backstop against a stream that dribbles forever.
+//
+// CHAT_IDLE_TIMEOUT_MS is generous because these models think before they emit:
+// the first token can legitimately be a minute away while the model reasons.
+const CHAT_IDLE_TIMEOUT_MS = 120 * 1000;
+const CHAT_TOTAL_TIMEOUT_MS = 15 * 60 * 1000;
+// SSE comment sent while the model is quiet, so proxies between the browser and
+// this process see traffic and do not close an idle connection.
+const CHAT_HEARTBEAT_MS = 15 * 1000;
 
 // One SQLite handle for the whole process. connect() applies the pragmas the
 // schema depends on - foreign_keys above all, without which ON DELETE CASCADE
@@ -52,7 +97,9 @@ function requireSecret(name) {
 }
 
 app.use(cookieParser());
-app.use(express.json({ limit: '12mb' }));
+// Attached images arrive base64-encoded inside the JSON body, which is a third
+// larger than the files themselves; MAX_IMAGES * MAX_IMAGE_BYTES has to fit.
+app.use(express.json({ limit: '25mb' }));
 app.use((_req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -152,10 +199,31 @@ function safeEqual(a, b) {
   const bb = Buffer.from(String(b));
   return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
 }
+// A shared daily allowance that is spent behaves nothing like a momentary burst
+// limit: no amount of retrying clears it. Telling someone to "try again in a
+// moment" for hours is what makes a working portal look broken, so it is
+// recognised separately.
+const DAILY_LIMIT = /free-models-per-day|free_tier_daily|per-?day|daily limit/i;
+
+/** The provider often says when the allowance resets; pass that on verbatim. */
+function dailyResetNote(raw) {
+  const stamp = /"X-RateLimit-Reset"\s*:\s*"?(\d{10,})"?/.exec(raw);
+  if (!stamp) return '';
+  const when = new Date(Number(stamp[1]));
+  if (Number.isNaN(when.getTime())) return '';
+  return ` It resets at ${when.toISOString().replace('T', ' ').slice(0, 16)} UTC.`;
+}
+
 function cleanError(error, fallback = 'Something went wrong') {
   const raw = String(error?.message || error || '');
+  if (DAILY_LIMIT.test(raw)) {
+    return `This workspace has used up its shared daily AI allowance.${dailyResetNote(raw)} Retrying will not help until then - contact the platform owner if the team needs more.`;
+  }
   if (/budget/i.test(raw)) return 'Your AI usage limit has been reached. Contact the platform owner if you need more access.';
   if (/rate.?limit|429/i.test(raw)) return 'AI is busy right now. Try again in a moment.';
+  // What LiteLLM says once it has cooled a failing model down. Left generic on
+  // purpose: the underlying cause is already reported above on the first hit.
+  if (/no deployments available/i.test(raw)) return 'AI is briefly unavailable while the gateway backs off from repeated provider errors. Try again in a minute.';
   if (/authentication|api.?key|401|403/i.test(raw)) return 'AI access needs attention. Please contact the platform owner.';
   return fallback;
 }
@@ -189,7 +257,7 @@ async function provisionLiteLLMUser({ id, name, email }) {
   const keyBody = {
     user_id: litellmUserId,
     key_alias: `jsan-${email}`,
-    models: DEV_MODELS,
+    models: KEY_MODELS,
     metadata: { app: 'jsan-dev-ai', email }
   };
   if (DEV_MONTHLY_BUDGET > 0) {
@@ -218,6 +286,11 @@ async function revokeLiteLLMUser({ litellmUserId, key }) {
 // Distinguishes "this signup cannot be allowed" (409) from an infrastructure
 // failure (502) once both are raised out of the same transaction.
 class RegistrationConflict extends Error {}
+
+// An error whose message is already written for the developer who will read it.
+// cleanError() rewrites raw upstream failures into something presentable; these
+// are passed through untouched, since rewriting them only loses detail.
+class ChatUserError extends Error {}
 
 function getUserById(id) {
   return db.prepare('SELECT * FROM jsan_users WHERE id=?').get(id) || null;
@@ -359,6 +432,49 @@ app.post('/api/me/api-key/rotate', auth, async (req, res) => {
   }
 });
 
+// The composer sends an attached file as its full text, because that is what the
+// model has to read. The developer has already seen that file - replaying its
+// body inside their own message turns a one-line question into a wall of code
+// the moment the conversation is reopened. Stored messages keep the full text
+// for the model; what is sent back for display carries the same chip the
+// composer showed when the message was sent.
+// Matches one opening marker, anchored to a single line so it cannot backtrack.
+const ATTACHMENT_OPEN = /^--- Attached file: (.+) ---$/;
+
+/**
+ * Fold each attached file's body back into the chip the composer showed.
+ *
+ * Deliberately a line scan rather than one regex over the whole message. The
+ * regex this replaced paired the markers with a lazy quantifier and a
+ * backreference, which is quadratic when a closing marker is missing: a crafted
+ * 12 MB message carrying 20k unclosed markers blocked the event loop for 11
+ * seconds, stalling every other developer on a single-replica portal. This
+ * version is linear, and an unterminated block simply runs to the end.
+ */
+function foldAttachments(content) {
+  const text = String(content);
+  // The common case is a message with no attachment at all, which should not
+  // pay for a scan of its own length.
+  if (!text.includes('--- Attached file: ')) return text;
+  const names = [];
+  const kept = [];
+  let closing = null;
+  for (const line of text.split('\n')) {
+    if (closing !== null) {
+      if (line === closing) closing = null;
+      continue;
+    }
+    const opened = ATTACHMENT_OPEN.exec(line);
+    if (!opened) { kept.push(line); continue; }
+    names.push(opened[1]);
+    closing = `--- End ${opened[1]} ---`;
+    // The blank line the composer writes before a block belongs to the block.
+    if (kept[kept.length - 1] === '') kept.pop();
+  }
+  const folded = kept.join('\n');
+  return names.length ? `${folded}\n\n${names.map(name => `\u{1F4CE} ${name}`).join('\n')}` : folded;
+}
+
 app.get('/api/conversations', auth, (req, res) => {
   res.json(db.prepare('SELECT id,title,mode,created_at,updated_at FROM jsan_conversations WHERE user_id=? ORDER BY updated_at DESC LIMIT 60').all(req.user.id));
 });
@@ -367,7 +483,22 @@ app.get('/api/conversations/:id', auth, (req, res) => {
   if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
   // created_at has millisecond resolution, so rowid breaks ties in insertion
   // order and a question can never sort after its own answer.
-  const messages = db.prepare('SELECT id,role,content,created_at FROM jsan_messages WHERE conversation_id=? ORDER BY created_at ASC, rowid ASC').all(req.params.id);
+  // One query for every image in the conversation rather than one per message.
+  // The bytes stay behind /api/images/:id so reopening a conversation does not
+  // drag megabytes of screenshots through this response.
+  const byMessage = new Map();
+  for (const row of db.prepare(`SELECT i.id, i.message_id, i.name FROM jsan_message_images i
+      JOIN jsan_messages m ON m.id = i.message_id
+      WHERE m.conversation_id = ? ORDER BY i.rowid`).all(req.params.id)) {
+    if (!byMessage.has(row.message_id)) byMessage.set(row.message_id, []);
+    byMessage.get(row.message_id).push({ id: row.id, name: row.name });
+  }
+  const messages = db.prepare('SELECT id,role,content,created_at FROM jsan_messages WHERE conversation_id=? ORDER BY created_at ASC, rowid ASC').all(req.params.id)
+    .map(m => {
+      const withText = m.role === 'user' ? { ...m, content: foldAttachments(m.content) } : { ...m };
+      const attached = byMessage.get(m.id);
+      return attached ? { ...withText, images: attached } : withText;
+    });
   res.json({ ...conversation, messages });
 });
 app.delete('/api/conversations/:id', auth, (req, res) => {
@@ -375,49 +506,271 @@ app.delete('/api/conversations/:id', auth, (req, res) => {
   res.json({ ok: true });
 });
 
+/**
+ * Split a byte stream of Server-Sent Events into `data:` payloads.
+ *
+ * Chunk boundaries fall wherever the network puts them, so a frame can arrive
+ * split across two reads: everything after the last blank line is held back
+ * until the rest of it turns up.
+ */
+async function* sseData(webStream) {
+  const decoder = new TextDecoder();
+  let buffer = '';
+  for await (const chunk of Readable.fromWeb(webStream)) {
+    buffer += decoder.decode(chunk, { stream: true });
+    const frames = buffer.split(/\r?\n\r?\n/);
+    buffer = frames.pop() ?? '';
+    for (const frame of frames) {
+      const payload = frame
+        .split(/\r?\n/)
+        .filter(line => line.startsWith('data:'))
+        .map(line => line.slice(5).trim())
+        .join('');
+      if (payload) yield payload;
+    }
+  }
+}
+
+// Chat turn.
+//
+// The response is streamed as SSE rather than returned whole. That is not
+// cosmetic: a real answer from these reasoning models runs for minutes, and the
+// single-shot version of this route timed out at two minutes with nothing to
+// show for the wait. Streaming also keeps bytes moving, so no proxy in between
+// decides the connection is idle.
+//
+// Frames sent to the browser:
+//   start     {conversationId}  — sent before the model is called
+//   thinking  {}                — sent once, if the model reasons before it
+//                                 answers. A status only: the reasoning text
+//                                 itself is the model's scratchpad and is never
+//                                 forwarded, so nothing the developer did not
+//                                 type can end up in the conversation
+//   delta     {text}            — answer text, to append
+//   done      {conversationId, truncated}
+//   error     {error}           — after `start`, failures arrive here, not as
+//                                 an HTTP status, because 200 is already sent
+// Serves an image back to the developer who sent it. The join to
+// jsan_conversations is the authorization: an id belonging to somebody else's
+// conversation returns 404 rather than the picture.
+app.get('/api/images/:id', auth, (req, res) => {
+  const row = db.prepare(`SELECT i.mime, i.data FROM jsan_message_images i
+    JOIN jsan_messages m ON m.id = i.message_id
+    JOIN jsan_conversations c ON c.id = m.conversation_id
+    WHERE i.id = ? AND c.user_id = ?`).get(req.params.id, req.user.id);
+  if (!row) return res.status(404).json({ error: 'Image not found' });
+  const bytes = Buffer.from(row.data, 'base64');
+  res.setHeader('Content-Type', row.mime);
+  res.setHeader('Content-Length', bytes.length);
+  // Private: the response is scoped to one signed-in developer, so no shared
+  // cache between them may keep a copy.
+  res.setHeader('Cache-Control', 'private, max-age=86400');
+  res.end(bytes);
+});
+
 app.post('/api/chat', auth, chatLimiter, async (req, res) => {
-  const message = String(req.body?.message || '').trim();
   const mode = String(req.body?.mode || 'auto');
   const conversationId = req.body?.conversationId;
+  const images = Array.isArray(req.body?.images) ? req.body.images.slice(0, MAX_IMAGES) : [];
+  // An image on its own is a complete question - "what is wrong here?" is
+  // implied by sending a screenshot - so it does not also need typed words.
+  const message = String(req.body?.message || '').trim() || (images.length ? 'What is in this image?' : '');
   if (!message) return res.status(400).json({ error: 'Write a message first' });
   if (!DEV_MODELS.includes(mode)) return res.status(400).json({ error: 'Unknown mode' });
+  for (const image of images) {
+    if (!ALLOWED_IMAGE_MIME.has(String(image?.mime))) {
+      return res.status(400).json({ error: 'Images must be PNG, JPEG, WebP or GIF' });
+    }
+    if (typeof image?.data !== 'string' || !/^[A-Za-z0-9+/=]+$/.test(image.data)) {
+      return res.status(400).json({ error: 'An attached image could not be read' });
+    }
+    // Bytes from base64 length, without decoding megabytes to find out.
+    if (Math.floor(image.data.length * 3 / 4) > MAX_IMAGE_BYTES) {
+      return res.status(400).json({ error: `Each image must be under ${(MAX_IMAGE_BYTES / 1e6).toFixed(1)} MB` });
+    }
+  }
+
+  // Read the key before anything is written, so a key this process cannot
+  // decrypt fails as a plain HTTP error and leaves no half-finished turn behind.
+  let key;
+  try { key = decryptKey(req.user); }
+  catch { return res.status(500).json({ error: 'Could not read your developer key' }); }
 
   let cid = conversationId;
+  let conversationIsNew = false;
   if (!cid) {
     cid = crypto.randomUUID();
-    const title = message.replace(/\s+/g, ' ').slice(0, 64);
+    const title = foldAttachments(message).replace(/\s+/g, ' ').trim().slice(0, 64) || 'New conversation';
     db.prepare('INSERT INTO jsan_conversations(id,user_id,title,mode) VALUES(?,?,?,?)').run(cid, req.user.id, title, mode);
+    conversationIsNew = true;
   } else {
     const owned = db.prepare('SELECT id FROM jsan_conversations WHERE id=? AND user_id=?').get(cid, req.user.id);
     if (!owned) return res.status(404).json({ error: 'Conversation not found' });
     db.prepare('UPDATE jsan_conversations SET mode=?,updated_at=? WHERE id=?').run(mode, nowIso(), cid);
   }
 
-  db.prepare('INSERT INTO jsan_messages(id,conversation_id,role,content) VALUES(?,?,?,?)').run(crypto.randomUUID(), cid, 'user', message);
-  const history = db.prepare('SELECT role,content FROM jsan_messages WHERE conversation_id=? ORDER BY created_at ASC, rowid ASC LIMIT 60').all(cid);
+  const userMessageId = crypto.randomUUID();
+  db.prepare('INSERT INTO jsan_messages(id,conversation_id,role,content) VALUES(?,?,?,?)').run(userMessageId, cid, 'user', message);
+  for (const image of images) {
+    db.prepare('INSERT INTO jsan_message_images(id,message_id,name,mime,data) VALUES(?,?,?,?,?)')
+      .run(crypto.randomUUID(), userMessageId, String(image.name || 'image'), image.mime, image.data);
+  }
+  const history = db.prepare('SELECT id,role,content FROM jsan_messages WHERE conversation_id=? ORDER BY created_at ASC, rowid ASC LIMIT 60').all(cid);
 
+  // Collect the images still close enough to the end of the conversation to be
+  // worth resending, newest first so the cap keeps the most relevant ones.
+  const carried = new Map();
+  let carriedCount = 0;
+  for (const m of history.slice(-IMAGE_LOOKBACK_MESSAGES).reverse()) {
+    if (m.role !== 'user' || carriedCount >= MAX_IMAGES) continue;
+    const rows = db.prepare('SELECT name,mime,data FROM jsan_message_images WHERE message_id=? ORDER BY rowid').all(m.id)
+      .slice(0, MAX_IMAGES - carriedCount);
+    if (!rows.length) continue;
+    carried.set(m.id, rows);
+    carriedCount += rows.length;
+  }
+
+  // A payload holding an image can only go to the vision route, whatever mode
+  // the composer had selected.
+  const usesVision = carried.size > 0;
+  const modelMessages = history.map(m => {
+    const attached = carried.get(m.id);
+    if (!attached) return { role: m.role, content: m.content };
+    return {
+      role: m.role,
+      content: [
+        { type: 'text', text: m.content },
+        ...attached.map(img => ({ type: 'image_url', image_url: { url: `data:${img.mime};base64,${img.data}` } }))
+      ]
+    };
+  });
+
+  // A turn that produced no answer is removed again. Without this the question
+  // stays in the developer's history with nothing under it, and every later
+  // turn in that conversation resends it to the model as unanswered context.
+  const discardTurn = () => {
+    try {
+      // Both cascade to jsan_message_images, so a discarded turn takes its
+      // screenshots with it rather than orphaning them in the database.
+      if (conversationIsNew) db.prepare('DELETE FROM jsan_conversations WHERE id=?').run(cid);
+      else db.prepare('DELETE FROM jsan_messages WHERE id=?').run(userMessageId);
+    } catch (e) {
+      console.error('Could not roll back the failed turn:', e.message);
+    }
+  };
+
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  // Tells nginx-style proxies not to buffer the response into oblivion.
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  // A browser that goes away mid-answer destroys the socket under us, and a
+  // write to a destroyed socket raises on the response object. Both are normal
+  // here, so neither is allowed to take the process down.
+  res.on('error', () => {});
+  const open = () => !res.writableEnded && !res.destroyed;
+  const send = (event, data) => {
+    if (open()) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+  send('start', { conversationId: cid });
+
+  const controller = new AbortController();
+  let stopReason = null; // 'idle' | 'total' | 'client'
+  const stop = (reason) => { stopReason = reason; controller.abort(); };
+
+  let idleTimer = null;
+  const bumpIdle = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => stop('idle'), CHAT_IDLE_TIMEOUT_MS);
+  };
+  const totalTimer = setTimeout(() => stop('total'), CHAT_TOTAL_TIMEOUT_MS);
+  const heartbeat = setInterval(() => { if (open()) res.write(': ping\n\n'); }, CHAT_HEARTBEAT_MS);
+  // The browser closing the tab or pressing stop should not leave a generation
+  // running against the developer's rate limit.
+  res.on('close', () => { if (!res.writableEnded) stop('client'); });
+  bumpIdle();
+
+  let answer = '';
+  let truncated = false;
+  let announcedThinking = false;
   try {
-    const key = decryptKey(req.user);
     const upstream = await fetch(`${LITELLM_BASE_URL}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
       body: JSON.stringify({
-        model: mode,
-        messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...history.map(x => ({ role: x.role, content: x.content }))],
+        model: usesVision ? VISION_MODEL : mode,
+        messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...modelMessages],
+        stream: true,
         user: req.user.id
       }),
-      signal: AbortSignal.timeout(120000)
+      signal: controller.signal
     });
-    const raw = await upstream.text();
-    let data; try { data = JSON.parse(raw); } catch { data = {}; }
-    if (!upstream.ok) throw new Error(data?.error?.message || data?.detail?.error || raw.slice(0, 500));
-    const answer = data.choices?.[0]?.message?.content || 'The model returned an empty response.';
+    if (!upstream.ok || !upstream.body) {
+      const raw = await upstream.text().catch(() => '');
+      let data; try { data = JSON.parse(raw); } catch { data = {}; }
+      throw new Error(data?.error?.message || data?.detail?.error || data?.detail || raw.slice(0, 500) || `Gateway ${upstream.status}`);
+    }
+
+    for await (const payload of sseData(upstream.body)) {
+      bumpIdle();
+      if (payload === '[DONE]') break;
+      let frame; try { frame = JSON.parse(payload); } catch { continue; }
+      // LiteLLM reports a mid-stream provider failure inside the stream, where
+      // it would otherwise be swallowed as a short answer.
+      if (frame.error) throw new Error(frame.error?.message || String(frame.error));
+      const choice = frame.choices?.[0];
+      if (!choice) continue;
+      const delta = choice.delta || {};
+      // Reasoning is the model's scratchpad, not its answer. The fact that it is
+      // reasoning is worth showing; the text of it is not, so only the status
+      // goes out, once.
+      if (delta.reasoning && !announcedThinking) { announcedThinking = true; send('thinking', {}); }
+      if (delta.content) {
+        answer += delta.content;
+        send('delta', { text: delta.content });
+      }
+      if (choice.finish_reason === 'length') truncated = true;
+    }
+
+    if (stopReason === 'client') throw new Error('CLIENT_CLOSED');
+    if (!answer.trim()) {
+      // Reaching here means the whole output allowance went on reasoning.
+      // Saying so is more useful than storing an empty turn nobody can act on.
+      throw new ChatUserError('The model spent its whole output allowance on reasoning and returned no answer. Try Fast or Code mode, or ask for a shorter answer.');
+    }
+
     db.prepare('INSERT INTO jsan_messages(id,conversation_id,role,content) VALUES(?,?,?,?)').run(crypto.randomUUID(), cid, 'assistant', answer);
     db.prepare('UPDATE jsan_conversations SET updated_at=? WHERE id=?').run(nowIso(), cid);
-    res.json({ conversationId: cid, answer });
+    send('done', { conversationId: cid, truncated });
   } catch (e) {
-    console.error('Chat failed:', e.message);
-    res.status(502).json({ error: cleanError(e, 'AI is unavailable right now. Try again shortly.') });
+    // A partial answer is worth keeping: the developer watched it arrive, and
+    // losing it on a dropped connection is worse than storing it unfinished.
+    if (stopReason === 'client' && answer.trim()) {
+      try {
+        db.prepare('INSERT INTO jsan_messages(id,conversation_id,role,content) VALUES(?,?,?,?)').run(crypto.randomUUID(), cid, 'assistant', answer);
+        db.prepare('UPDATE jsan_conversations SET updated_at=? WHERE id=?').run(nowIso(), cid);
+      } catch (saveError) {
+        console.error('Could not save the partial answer:', saveError.message);
+      }
+    } else {
+      discardTurn();
+      if (stopReason !== 'client') {
+        const timedOut = stopReason === 'idle' || stopReason === 'total';
+        console.error('Chat failed:', timedOut ? `stream ${stopReason} timeout` : e.message);
+        send('error', {
+          error: timedOut
+            ? 'The model stopped responding. Try again, or use Fast mode for a quicker answer.'
+            : e instanceof ChatUserError ? e.message
+            : cleanError(e, 'AI is unavailable right now. Try again shortly.')
+        });
+      }
+    }
+  } finally {
+    clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
+    clearInterval(heartbeat);
+    if (open()) res.end();
   }
 });
 
@@ -492,4 +845,28 @@ app.use((req, res, next) => {
   next();
 });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`JSAN Dev AI listening on ${PORT} - database ${databasePath()}`));
+// A virtual key is scoped to a fixed list of model names when it is issued, so
+// keys handed out before `see` existed would be refused the vision route and
+// screenshots would fail for exactly the developers who have been here longest.
+// Run once at boot: idempotent, bounded by the seat cap, and a failure is logged
+// rather than fatal, since text still works without it.
+async function widenKeyScopes() {
+  const users = db.prepare('SELECT id,email,litellm_key_ciphertext,litellm_key_iv,litellm_key_tag FROM jsan_users').all();
+  if (!users.length) return;
+  let updated = 0;
+  for (const user of users) {
+    try {
+      await litellmFetch('/key/update', { method: 'POST', body: { key: decryptKey(user), models: KEY_MODELS } });
+      updated++;
+    } catch (e) {
+      console.error(`Could not widen the key scope for ${user.email}:`, e.message);
+    }
+  }
+  console.log(`Developer keys scoped to [${KEY_MODELS.join(', ')}]: ${updated}/${users.length}`);
+}
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`JSAN Dev AI listening on ${PORT} - database ${databasePath()}`);
+  // After listen, never before it: the healthcheck must not wait on LiteLLM.
+  widenKeyScopes();
+});

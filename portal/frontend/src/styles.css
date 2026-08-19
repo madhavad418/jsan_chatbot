@@ -204,6 +204,60 @@
   outline-color:var(--jsan-sky);
 }
 
+/* ---------- Streaming answer ---------- */
+/* The answer arrives token by token, so the caret marks where it is up to and a
+   pause reads as thinking rather than a hang. Only the answer is shown: the
+   model's reasoning never reaches the browser, so the thread holds nothing but
+   the developer's own message and the reply to it. */
+.stream-caret{
+  display:inline-block;width:2px;height:13px;margin-left:1px;vertical-align:-2px;
+  background:var(--muted);animation:caret 1.05s steps(1) infinite
+}
+@keyframes caret{50%{opacity:0}}
+/* While an answer streams, the send control becomes a stop control. It is
+   deliberately quieter than send: stopping is available, not encouraged. */
+.send-button.stop{background:var(--panel2);color:var(--text);border:1px solid var(--line2);box-shadow:none}
+.send-button.stop svg{fill:currentColor}
+.send-button.stop:hover{background:var(--soft);color:var(--accent)}
+/* Not an error - the answer is usable, it just stops early. */
+.chat-notice{
+  max-width:760px;margin:0 auto 12px;font-size:11px;line-height:1.5;border-radius:8px;padding:10px 11px;
+  color:var(--text);
+  background:color-mix(in srgb,#e0a33c 12%,var(--panel));
+  border:1px solid color-mix(in srgb,#e0a33c 38%,var(--line))
+}
+
+/* ---------- Attached images ---------- */
+/* A screenshot in the composer and in the question it was sent with. The
+   thumbnail in the chip is what tells the developer they picked the right
+   file before they send it. */
+.chip-thumb{width:18px;height:18px;border-radius:4px;object-fit:cover;flex:0 0 auto}
+.message-images{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.message-images img{
+  max-width:220px;max-height:180px;border-radius:9px;border:1px solid var(--line);
+  background:var(--panel2);display:block;object-fit:contain
+}
+
+/* ---------- Code blocks ---------- */
+/* An answer's code is usually meant to become a file, so each block carries its
+   own copy and download rather than only the copy-the-whole-answer button. */
+.code-block{margin:0 0 11px;border-radius:10px;overflow:hidden;border:1px solid rgba(255,255,255,.07)}
+.code-bar{
+  display:flex;align-items:center;gap:6px;padding:5px 7px 5px 11px;
+  background:color-mix(in srgb,var(--code) 82%,#fff);border-bottom:1px solid rgba(255,255,255,.07)
+}
+.code-lang{
+  flex:1;font-size:8px;font-weight:750;text-transform:uppercase;letter-spacing:.09em;
+  color:rgba(237,241,247,.5)
+}
+.code-bar button{
+  border:0;background:transparent;color:rgba(237,241,247,.62);border-radius:6px;
+  padding:4px 7px;display:flex;align-items:center;gap:5px;font-size:9px;font-weight:650
+}
+.code-bar button:hover{background:rgba(255,255,255,.09);color:#fff}
+/* The block already draws the frame, so the pre inside it drops its own. */
+.code-block pre{margin:0;border:0;border-radius:0}
+
 /* ---------- Responsive: stack the panel above the card ---------- */
 @media (max-width:980px){
   .auth-main{grid-template-columns:1fr;min-height:0}

@@ -23,6 +23,20 @@ The frontend and backend ship in a single container: the Dockerfile builds
 `frontend/` and copies the bundle into the runtime image that runs the Express
 server, which serves it as static files.
 
+`POST /api/chat` answers with Server-Sent Events rather than a single JSON body.
+A real engineering answer from these models runs for minutes, so the browser
+renders it as it arrives instead of waiting — and a turn that fails is rolled
+back rather than left in the history as a question with nothing under it. The
+public `/v1` edge is untouched: it proxies LiteLLM directly and streams whatever
+the calling tool asked for.
+
+A question carrying a screenshot is routed to a vision model automatically — the
+four modes are text-only — and the image is stored beside the message rather than
+inside it, so reopening a conversation shows the picture and not a megabyte of
+base64. Answers render each code block with its own download control. Read the
+free-tier request ceiling in `RAILWAY_DEPLOYMENT_GUIDE.md` before putting a team
+on this.
+
 Run the two backing services locally with
 `docker compose -f docker-compose.local.yml up -d`.
 

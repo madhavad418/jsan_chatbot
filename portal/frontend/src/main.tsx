@@ -3,8 +3,8 @@ import { createRoot } from 'react-dom/client';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
-  ArrowUp, Check, ChevronDown, Code2, Copy, Gauge, KeyRound, LogOut,
-  Menu, MessageSquarePlus, Moon, Paperclip, RotateCcw, Search, Sparkles,
+  ArrowUp, Check, ChevronDown, Code2, Copy, Download, Gauge, KeyRound, LogOut,
+  Menu, MessageSquarePlus, Moon, Paperclip, RotateCcw, Search, Sparkles, Square,
   Sun, Terminal, Trash2, Wrench, X, Zap, BrainCircuit, Bug, GitPullRequest,
   Blocks, BookOpenText, ShieldCheck, ExternalLink, CheckCircle2
 } from 'lucide-react';
@@ -12,11 +12,43 @@ import './styles.css';
 
 type User = { id:string; name:string; email:string };
 type Conv = { id:string; title:string; mode:string; updated_at:string };
-type Msg = { role:'user'|'assistant'; content:string };
+/** An image already sent. `url` is a data URL while the turn is live, and
+ *  /api/images/:id once the conversation is reloaded from the server. */
+type MsgImage = { name:string; url:string };
+type Msg = { role:'user'|'assistant'; content:string; images?:MsgImage[] };
 type Mode = 'auto'|'code'|'think'|'fast';
 type Usage = { spend:number; maxBudget:number|null; budgetDuration:string|null; models:string[]; rpmLimit:number|null; tpmLimit:number|null };
 
-type Attachment = { name:string; size:number; content:string };
+// Two kinds, because the two travel differently: a text file is folded into the
+// message the model reads, an image is sent beside it and makes the server route
+// the question to the vision model rather than the mode the composer shows.
+type Attachment =
+  | { kind:'text'; name:string; size:number; content:string }
+  | { kind:'image'; name:string; size:number; mime:string; data:string };
+
+const MAX_ATTACHMENT_BYTES = 750_000;
+const MAX_IMAGE_BYTES = 1_500_000;
+const MAX_ATTACHMENTS = 4;
+const IMAGE_MIME = ['image/png','image/jpeg','image/webp','image/gif'];
+// Steers the file picker toward what the platform can read. It is a hint, not a
+// guarantee — every picker offers an "all files" escape — so pickFiles checks
+// each file as well.
+const ATTACH_ACCEPT = [...IMAGE_MIME,'text/*','.js','.jsx','.ts','.tsx','.json','.md','.py','.java','.go','.rs','.rb','.php','.c','.h','.cpp','.cs','.css','.html','.sql','.sh','.yml','.yaml','.xml','.toml','.ini','.log','.csv'].join(',');
+/** A NUL byte means a file read as text was never text: a PDF, an archive, a
+ *  binary. Written as a pattern so no NUL has to sit in this source file. */
+const BINARY_MARKER = /\u0000/;
+
+/** Base64 payload of a file, without the `data:<mime>;base64,` prefix. */
+function readBase64(file:File):Promise<string>{
+  return new Promise((resolve,reject)=>{
+    const reader=new FileReader();
+    reader.onerror=()=>reject(reader.error);
+    reader.onload=()=>resolve(String(reader.result).split(',')[1]||'');
+    reader.readAsDataURL(file);
+  });
+}
+
+const imageSrc=(a:Extract<Attachment,{kind:'image'}>)=>`data:${a.mime};base64,${a.data}`;
 
 const MODES:{id:Mode; label:string; hint:string; icon:any}[] = [
   {id:'auto', label:'Auto', hint:'Best fit for the task', icon:Sparkles},
@@ -48,12 +80,101 @@ async function api(path:string, options:RequestInit = {}) {
   return data;
 }
 
+type StreamEvent = { event:string; data:any };
+
+/**
+ * Read an SSE response body and yield one decoded frame at a time.
+ *
+ * Frames are separated by a blank line, and a frame can straddle two network
+ * reads, so whatever follows the last blank line is carried over to the next
+ * chunk. Lines starting with `:` are heartbeat comments and carry no data.
+ */
+async function* readEvents(body:ReadableStream<Uint8Array>):AsyncGenerator<StreamEvent> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  for(;;){
+    const {value,done} = await reader.read();
+    if(done) break;
+    buffer += decoder.decode(value,{stream:true});
+    const frames = buffer.split(/\r?\n\r?\n/);
+    buffer = frames.pop() ?? '';
+    for(const frame of frames){
+      let event = 'message'; let data = '';
+      for(const line of frame.split(/\r?\n/)){
+        if(line.startsWith('event:')) event = line.slice(6).trim();
+        else if(line.startsWith('data:')) data += line.slice(5).trim();
+      }
+      if(!data) continue;
+      try { yield {event, data: JSON.parse(data)}; } catch {}
+    }
+  }
+}
+
 function CopyButton({value,small=false}:{value:string;small?:boolean}) {
   const [done,setDone] = useState(false);
   return <button className={`icon-button ${small?'small':''}`} title="Copy" onClick={async()=>{
     await navigator.clipboard.writeText(value); setDone(true); setTimeout(()=>setDone(false),1200);
   }}>{done ? <Check size={14}/> : <Copy size={14}/>}</button>;
 }
+
+/** Flatten a rendered markdown node back to the source text inside it. */
+function textOf(node:any):string{
+  if(node==null||node===false||node===true) return '';
+  if(typeof node==='string'||typeof node==='number') return String(node);
+  if(Array.isArray(node)) return node.map(textOf).join('');
+  if(node.props?.children!==undefined) return textOf(node.props.children);
+  return '';
+}
+
+const CODE_EXTENSIONS:Record<string,string> = {
+  javascript:'js', js:'js', jsx:'jsx', typescript:'ts', ts:'ts', tsx:'tsx',
+  python:'py', py:'py', java:'java', go:'go', golang:'go', rust:'rs', rs:'rs',
+  c:'c', cpp:'cpp', csharp:'cs', cs:'cs', php:'php', ruby:'rb', rb:'rb',
+  bash:'sh', sh:'sh', shell:'sh', zsh:'sh', powershell:'ps1', sql:'sql',
+  json:'json', yaml:'yml', yml:'yml', toml:'toml', xml:'xml', html:'html',
+  css:'css', scss:'scss', markdown:'md', md:'md', dockerfile:'Dockerfile',
+  ini:'ini', diff:'diff', env:'env'
+};
+
+/**
+ * Save one code block to disk.
+ *
+ * Models routinely open a block with the path the code is meant to live at, so
+ * that comment becomes the filename when it is there — saving four files out of
+ * one answer should not produce four copies of `snippet.js`.
+ */
+function downloadCode(text:string, language:string){
+  const declared = /^\s*(?:\/\/|#|--|<!--|\/\*)\s*([\w./-]+\.[A-Za-z0-9]{1,6})\b/.exec(text)?.[1];
+  const name = declared?.split('/').pop() || `snippet.${CODE_EXTENSIONS[language.toLowerCase()] || 'txt'}`;
+  const url = URL.createObjectURL(new Blob([text],{type:'text/plain;charset=utf-8'}));
+  const link = document.createElement('a');
+  link.href = url; link.download = name;
+  document.body.appendChild(link); link.click(); link.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),2000);
+}
+
+/** A fenced code block, with its own copy and download controls. */
+function CodeBlock({children,node,...rest}:any){
+  const code = Array.isArray(children) ? children[0] : children;
+  const language = /language-([\w+#-]+)/.exec(code?.props?.className || '')?.[1] || '';
+  const text = textOf(code).replace(/\n$/,'');
+  const [copied,setCopied] = useState(false);
+  return <div className="code-block">
+    <div className="code-bar">
+      <span className="code-lang">{language||'text'}</span>
+      <button onClick={async()=>{await navigator.clipboard.writeText(text);setCopied(true);setTimeout(()=>setCopied(false),1200)}}>
+        {copied?<Check size={12}/>:<Copy size={12}/>}{copied?'Copied':'Copy'}
+      </button>
+      <button onClick={()=>downloadCode(text,language)} title="Save this block as a file">
+        <Download size={12}/>Download
+      </button>
+    </div>
+    <pre {...rest}>{children}</pre>
+  </div>;
+}
+
+const MARKDOWN_COMPONENTS = { pre: CodeBlock };
 
 /** JSAN wordmark + product lockup. `invert` renders it white for blue panels. */
 function Brand({compact=false, invert=false, size='md'}:{compact?:boolean; invert?:boolean; size?:'md'|'lg'}) {
@@ -193,9 +314,28 @@ function Chat({newChatToken=0, hidden=false}:{newChatToken?:number; hidden?:bool
   const [historyOpen,setHistoryOpen] = useState(false);
   const [search,setSearch] = useState('');
   const [attachments,setAttachments]=useState<Attachment[]>([]);
+  // The answer currently arriving, and whether the model reasoned before it
+  // started answering. Both are live-only and cleared when the turn ends. The
+  // reasoning itself is never received, so nothing but the developer's own
+  // message and the answer can appear in the thread.
+  const [streamText,setStreamText] = useState('');
+  const [thinking,setThinking] = useState(false);
+  const [notice,setNotice] = useState('');
   const fileRef=useRef<HTMLInputElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const threadRef = useRef<HTMLDivElement>(null);
+  // Follow the incoming text only while the developer is already at the bottom,
+  // so scrolling up to re-read something is not undone by the next token.
+  const follow = useRef(true);
+  // Bumped whenever the workspace is emptied or another conversation is opened.
+  // A stream still running from the previous one keeps draining — the server
+  // finishes and stores that answer where it belongs — but stops writing into
+  // the workspace the developer has moved on to.
+  const generation = useRef(0);
+  // Lets the developer stop a long answer once they have read enough. The
+  // server treats the closed connection as a stop and keeps what it sent.
+  const abortRef = useRef<AbortController|null>(null);
   const refresh = ()=>api('/api/conversations').then(setConvs).catch(()=>{});
   // Load the list on mount and again each time the user comes back to Chat,
   // so anything started in another tab or on another machine shows up.
@@ -203,7 +343,21 @@ function Chat({newChatToken=0, hidden=false}:{newChatToken?:number; hidden?:bool
     if(!hidden) refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[hidden]);
+  // The composer starts one line tall and grows with what is typed. Without
+  // this it stays fixed at one line and a multi-line prompt disappears behind
+  // an internal scrollbar - you cannot see the second line of your own
+  // question. Capped at the same 170px the stylesheet uses, after which it
+  // scrolls. `* { box-sizing: border-box }` is what makes measuring against
+  // scrollHeight stable rather than growing by the padding on every keystroke.
+  useEffect(()=>{
+    const ta=composerRef.current; if(!ta) return;
+    ta.style.height='auto';
+    ta.style.height=`${Math.min(ta.scrollHeight,170)}px`;
+  },[input,attachments.length]);
   useEffect(()=>{ endRef.current?.scrollIntoView({behavior:'smooth'}); },[messages,busy]);
+  // Streaming lands many times a second, so this one jumps rather than animates
+  // — a smooth scroll restarting on every update never catches up.
+  useEffect(()=>{ if(streamText && follow.current) endRef.current?.scrollIntoView({behavior:'auto'}); },[streamText]);
   // Clear the workspace whenever "New chat" is triggered, from any page.
   // Focusing the composer is what makes the click feel like it did something —
   // without it, pressing New chat on an already-empty chat looks like a no-op.
@@ -212,20 +366,118 @@ function Chat({newChatToken=0, hidden=false}:{newChatToken?:number; hidden?:bool
   const firstToken = useRef(true);
   useEffect(()=>{
     if(firstToken.current){ firstToken.current = false; return; }
+    generation.current++;
     setActive(null); setMessages([]); setInput(''); setMode('auto'); setError(''); setAttachments([]);
+    setStreamText(''); setThinking(false); setNotice(''); setBusy(false);
     if(!hidden) composerRef.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   },[newChatToken]);
-  const load = async(id:string)=>{ const d=await api(`/api/conversations/${id}`); setActive(id); setMessages(d.messages.map((m:any)=>({role:m.role,content:m.content}))); setMode((d.mode||'auto') as Mode); setHistoryOpen(false); };
-  const pickFiles=async(files:FileList|null)=>{if(!files)return;const next:Attachment[]=[];for(const f of Array.from(files).slice(0,4)){if(f.size>750_000)continue;try{next.push({name:f.name,size:f.size,content:await f.text()})}catch{}}setAttachments(a=>[...a,...next].slice(0,4));if(fileRef.current)fileRef.current.value=''};
+  const load = async(id:string)=>{
+    const d=await api(`/api/conversations/${id}`);
+    generation.current++;
+    setActive(id);
+    setMessages(d.messages.map((m:any)=>({
+      role:m.role,
+      content:m.content,
+      // The bytes stay on the server; only a reference comes back with the
+      // conversation, so reopening one does not drag screenshots through JSON.
+      images:(m.images||[]).map((i:any)=>({name:i.name,url:`/api/images/${i.id}`}))
+    })));
+    setMode((d.mode||'auto') as Mode);
+    setHistoryOpen(false);
+    setStreamText(''); setThinking(false); setNotice(''); setError(''); setBusy(false);
+  };
+  // Text files are folded into the message the model reads. Images cannot be:
+  // they go alongside it, and the server routes the question to the vision
+  // model. Everything that cannot be used is said out loud — the version before
+  // this dropped an oversized file without a word and read a PNG as text.
+  const pickFiles=async(files:FileList|null)=>{
+    if(!files) return;
+    const accepted:Attachment[]=[]; const refused:string[]=[];
+    const mb=(n:number)=>`${(n/1e6).toFixed(n<1e6?2:1)} MB`;
+    for(const f of Array.from(files)){
+      if(f.type.startsWith('image/')){
+        if(!IMAGE_MIME.includes(f.type)){ refused.push(`${f.name} — images must be PNG, JPEG, WebP or GIF`); continue; }
+        if(f.size>MAX_IMAGE_BYTES){ refused.push(`${f.name} is ${mb(f.size)} — images are limited to ${mb(MAX_IMAGE_BYTES)}`); continue; }
+        try { accepted.push({kind:'image',name:f.name,size:f.size,mime:f.type,data:await readBase64(f)}); }
+        catch { refused.push(`${f.name} could not be read`); }
+        continue;
+      }
+      if(f.size>MAX_ATTACHMENT_BYTES){ refused.push(`${f.name} is ${mb(f.size)} — text files are limited to ${mb(MAX_ATTACHMENT_BYTES)}`); continue; }
+      let text:string;
+      try { text=await f.text(); } catch { refused.push(`${f.name} could not be read`); continue; }
+      if(BINARY_MARKER.test(text)){ refused.push(`${f.name} is neither text nor an image, so it cannot be read`); continue; }
+      accepted.push({kind:'text',name:f.name,size:f.size,content:text});
+    }
+    const room=Math.max(0,MAX_ATTACHMENTS-attachments.length);
+    if(accepted.length>room) refused.push(`only ${MAX_ATTACHMENTS} files can be attached at once`);
+    setAttachments(a=>[...a,...accepted.slice(0,room)].slice(0,MAX_ATTACHMENTS));
+    setNotice(refused.join(' · '));
+    if(fileRef.current) fileRef.current.value='';
+  };
   const send = async(text=input)=>{
     const base=text.trim(); if((!base&&!attachments.length)||busy)return;
-    const attached=attachments.map(a=>`\n\n--- Attached file: ${a.name} ---\n${a.content}\n--- End ${a.name} ---`).join('');
-    const message=(base||'Please review the attached file(s).')+attached;
-    const display=base+(attachments.length?`\n\n${attachments.map(a=>`📎 ${a.name}`).join('\n')}`:'');
-    setInput(''); setAttachments([]); setError(''); setBusy(true); setMessages(m=>[...m,{role:'user',content:display}]);
-    try{ const d=await api('/api/chat',{method:'POST',body:JSON.stringify({message,mode,conversationId:active})}); setActive(d.conversationId); setMessages(m=>[...m,{role:'assistant',content:d.answer}]); refresh(); }
-    catch(e:any){setMessages(m=>m.slice(0,-1));setInput(base);setError(e.message)} finally {setBusy(false)}
+    // Text files ride inside the message; images travel beside it, because the
+    // model has to be handed them as image parts rather than as characters.
+    const textFiles=attachments.filter(a=>a.kind==='text') as Extract<Attachment,{kind:'text'}>[];
+    const imageFiles=attachments.filter(a=>a.kind==='image') as Extract<Attachment,{kind:'image'}>[];
+    const attached=textFiles.map(a=>`\n\n--- Attached file: ${a.name} ---\n${a.content}\n--- End ${a.name} ---`).join('');
+    // An image is already a question on its own, so it needs no stand-in text;
+    // a text file sent without a question does.
+    const message=(base||(textFiles.length?'Please review the attached file(s).':''))+attached;
+    const display=base+(textFiles.length?`\n\n${textFiles.map(a=>`📎 ${a.name}`).join('\n')}`:'');
+    const shown=imageFiles.map(a=>({name:a.name,url:imageSrc(a)}));
+    // Held so a failed turn can put the developer back exactly where they were,
+    // attachments included, instead of making them pick the files again.
+    const sent=attachments;
+    const myGeneration=generation.current;
+    const stale=()=>generation.current!==myGeneration;
+    setInput(''); setAttachments([]); setError(''); setNotice(''); setThinking(false); setStreamText('');
+    setBusy(true); follow.current=true; setMessages(m=>[...m,{role:'user',content:display,images:shown}]);
+    // Tokens are accumulated here and pushed into React on a timer rather than
+    // on arrival: every update re-renders the whole markdown tree, and ~16
+    // frames a second reads as continuous without making the tab stutter.
+    let answer=''; let lastFlush=0;
+    const flush=()=>{ const now=Date.now(); if(now-lastFlush<60) return; lastFlush=now; setStreamText(answer); };
+    const controller=new AbortController(); abortRef.current=controller;
+    try{
+      const res=await fetch('/api/chat',{
+        method:'POST', credentials:'include',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({message,mode,conversationId:active,images:imageFiles.map(a=>({name:a.name,mime:a.mime,data:a.data}))}),
+        signal:controller.signal
+      });
+      // Anything rejected before the stream opens still answers as plain JSON.
+      if(!res.ok||!res.body){ const d=await res.json().catch(()=>({})); throw new Error(d.error||'Request failed'); }
+      let finished=false;
+      for await (const {event,data} of readEvents(res.body)){
+        // Keep reading after a reset so the server is never left writing into a
+        // socket nobody drains; just stop applying anything to the workspace.
+        if(stale()) continue;
+        if(event==='start') setActive(data.conversationId);
+        else if(event==='thinking') setThinking(true);
+        else if(event==='delta'){ answer+=String(data.text||''); flush(); }
+        else if(event==='error') throw new Error(data.error||'AI is unavailable right now. Try again shortly.');
+        else if(event==='done'){
+          finished=true;
+          // Committing the message and dropping the live buffer together keeps
+          // the answer from appearing twice for a frame.
+          setMessages(m=>[...m,{role:'assistant',content:answer}]); setStreamText(''); setThinking(false);
+          if(data.truncated) setNotice('That answer reached its length limit and stops early. Ask for the rest, or narrow the request.');
+        }
+      }
+      if(stale()){ refresh(); return; }
+      if(!finished) throw new Error('The connection dropped before the answer finished.');
+      refresh();
+    }
+    catch(e:any){
+      if(stale()) return;
+      // Stopping on purpose is not a failure: whatever arrived is the answer,
+      // and the server has already stored the same partial text.
+      if(e?.name==='AbortError' && answer.trim()){ setMessages(m=>[...m,{role:'assistant',content:answer}]); refresh(); }
+      else { setMessages(m=>m.slice(0,-1)); setInput(base); setAttachments(sent); if(e?.name!=='AbortError') setError(e.message); refresh(); }
+    }
+    finally { abortRef.current=null; setBusy(false); setStreamText(''); setThinking(false) }
   };
   const del = async(e:React.MouseEvent,id:string)=>{e.stopPropagation();await api(`/api/conversations/${id}`,{method:'DELETE'});if(active===id){setActive(null);setMessages([])}refresh()};
   const currentMode=MODES.find(m=>m.id===mode)!; const ModeIcon=currentMode.icon;
@@ -244,23 +496,39 @@ function Chat({newChatToken=0, hidden=false}:{newChatToken?:number; hidden?:bool
           {modeOpen&&<div className="mode-menu">{MODES.map(m=>{const I=m.icon;return <button key={m.id} className={m.id===mode?'selected':''} onClick={()=>{setMode(m.id);setModeOpen(false)}}><I size={15}/><div><strong>{m.label}</strong><span>{m.hint}</span></div>{m.id===mode&&<Check size={14}/>}</button>})}</div>}
         </div>
       </header>
-      <div className="thread">
+      <div className="thread" ref={threadRef} onScroll={()=>{const el=threadRef.current; follow.current = !el || el.scrollHeight-el.scrollTop-el.clientHeight < 120;}}>
         {messages.length===0 ? <div className="empty-state">
           <div className="hero-kicker"><span className="pulse-dot"/> Ready to work</div>
           <h1>What are you building?</h1>
           <p>Bring a bug, a feature, a codebase question or an architecture decision.</p>
           <div className="quick-grid">{QUICK.map(q=>{const I=q.icon;return <button key={q.title} onClick={()=>{setInput(q.text);setTimeout(()=>document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus(),0)}}><div className="quick-icon"><I size={16}/></div><div><strong>{q.title}</strong><span>{q.desc}</span></div><ArrowUp size={14}/></button>})}</div>
           <div className="starter-note"><ShieldCheck size={14}/><span>Use approved work content only. Review generated code before merging.</span></div>
-        </div> : messages.map((m,i)=>m.role==='user' ? <div className="user-message" key={i}><div>{m.content}</div></div> : <div className="assistant-message" key={i}><div className="assistant-icon"><Sparkles size={14}/></div><div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown><button className="copy-answer" onClick={()=>navigator.clipboard.writeText(m.content)}><Copy size={12}/>Copy response</button></div></div>)}
-        {busy&&<div className="assistant-message"><div className="assistant-icon"><Sparkles size={14}/></div><div className="thinking"><span>Working</span><i/><i/><i/></div></div>}
+        </div> : messages.map((m,i)=>m.role==='user'
+          ? <div className="user-message" key={i}><div>
+              {m.images?.length ? <div className="message-images">{m.images.map((img,j)=><img key={j} src={img.url} alt={img.name} title={img.name}/>)}</div> : null}
+              {m.content}
+            </div></div>
+          : <div className="assistant-message" key={i}><div className="assistant-icon"><Sparkles size={14}/></div><div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS}>{m.content}</ReactMarkdown><button className="copy-answer" onClick={()=>navigator.clipboard.writeText(m.content)}><Copy size={12}/>Copy response</button></div></div>)}
+        {busy&&<div className="assistant-message"><div className="assistant-icon"><Sparkles size={14}/></div>
+          {streamText
+            ? <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS}>{streamText}</ReactMarkdown><span className="stream-caret"/></div>
+            : <div className="thinking"><span>{thinking?'Thinking':'Working'}</span><i/><i/><i/></div>}
+        </div>}
+        {notice&&<div className="chat-notice">{notice}</div>}
         {error&&<div className="chat-error">{error}</div>}
         <div ref={endRef}/>
       </div>
       <footer className="composer-area">
         <div className="composer">
-          {attachments.length>0&&<div className="attachments">{attachments.map((a,i)=><span key={a.name+i}><Code2 size={12}/>{a.name}<button onClick={()=>setAttachments(x=>x.filter((_,j)=>j!==i))}><X size={11}/></button></span>)}</div>}
+          {attachments.length>0&&<div className="attachments">{attachments.map((a,i)=><span key={a.name+i}>
+            {a.kind==='image' ? <img className="chip-thumb" src={imageSrc(a)} alt=""/> : <Code2 size={12}/>}
+            {a.name}
+            <button onClick={()=>setAttachments(x=>x.filter((_,j)=>j!==i))}><X size={11}/></button>
+          </span>)}</div>}
           <textarea ref={composerRef} value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}}} placeholder="Ask about code, bugs, architecture or implementation…" rows={1}/>
-          <div className="composer-foot"><div className="composer-actions"><input ref={fileRef} type="file" multiple hidden onChange={e=>pickFiles(e.target.files)}/><button className="composer-tool" title="Attach text or code files" onClick={()=>fileRef.current?.click()}><Paperclip size={14}/><span>Attach</span></button><span className="mode-label"><ModeIcon size={12}/>{currentMode.label}</span></div><div className="send-side"><span>Enter to send</span><button className="send-button" disabled={(!input.trim()&&!attachments.length)||busy} onClick={()=>send()}><ArrowUp size={16}/></button></div></div>
+          <div className="composer-foot"><div className="composer-actions"><input ref={fileRef} type="file" accept={ATTACH_ACCEPT} multiple hidden onChange={e=>pickFiles(e.target.files)}/><button className="composer-tool" title="Attach code, text or a screenshot" onClick={()=>fileRef.current?.click()}><Paperclip size={14}/><span>Attach</span></button><span className="mode-label"><ModeIcon size={12}/>{currentMode.label}</span></div><div className="send-side"><span>{busy?'Streaming':'Enter to send'}</span>{busy
+              ? <button className="send-button stop" title="Stop generating" onClick={()=>abortRef.current?.abort()}><Square size={12}/></button>
+              : <button className="send-button" disabled={!input.trim()&&!attachments.length} onClick={()=>send()}><ArrowUp size={16}/></button>}</div></div>
         </div>
       </footer>
     </section>

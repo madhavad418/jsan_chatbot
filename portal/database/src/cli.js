@@ -11,7 +11,7 @@
 import fs from 'node:fs';
 import { connect, openDatabase, initSchema, databasePath, checkIntegrity } from './sqlite.js';
 
-const TABLES = ['jsan_users', 'jsan_conversations', 'jsan_messages'];
+const TABLES = ['jsan_users', 'jsan_conversations', 'jsan_messages', 'jsan_message_images'];
 
 function sizeOf(file) {
   try { return `${(fs.statSync(file).size / 1024).toFixed(1)} KB`; }

@@ -35,8 +35,11 @@ All four logical groups run on OpenRouter free-tier models, so one OpenRouter ke
 - `code` — Poolside Laguna S 2.1
 - `think` — Nemotron 3 Ultra 550B
 - `fast` — Nemotron 3.5 Lightning
+- `see` — Nemotron Nano 12B VL (images; selected automatically, never by hand)
 
-The free tier is rate limited per account rather than per developer, so validate throughput against 20 seats before relying on it. Moving a mode to a paid model or a direct provider key is a one-line change in `litellm/config.yaml`.
+A fifth route, `see`, is not a mode anyone selects: the portal switches to it by itself whenever a question carries an image, because the four above are text-in, text-out and cannot be handed a screenshot. It runs on `nvidia/nemotron-nano-12b-v2-vl:free` with `nemotron-3-nano-omni-30b-a3b-reasoning:free` behind it. No model on OpenRouter that *generates* images is free, so the portal cannot produce one; that would need credit and a paid route.
+
+**Measured on 2026-08-18, and the blocker for this pilot:** the OpenRouter free tier allows **50 free-model requests per day for the whole account**, not per developer — verified from a live `429`, which reports `X-RateLimit-Limit: 50`. Across 20 seats that is 2.5 questions per developer per day, which is not a usable service. Adding **$10 of credit raises it to 1000/day** (50 per developer per day), which is. Decide this before inviting the team; free models stay free per token either way, the credit only lifts the request ceiling. Moving a mode to a paid model or a direct provider key is a one-line change in `litellm/config.yaml`.
 
 Models can be stored in LiteLLM's DB (`STORE_MODEL_IN_DB=True`). If you need the LiteLLM Admin UI during maintenance, expose it only temporarily or put it behind your organization's access control; remove public exposure when finished. Never share the master key with developers.
 

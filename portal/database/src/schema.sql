@@ -51,11 +51,31 @@ CREATE TABLE IF NOT EXISTS jsan_messages (
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 ) STRICT;
 
+-- Images attached to a question. Kept out of jsan_messages.content because that
+-- column is text the model is given verbatim, and because SQLite truncates a
+-- TEXT value at its first NUL byte - which is 9 bytes into any PNG. The bytes
+-- live here base64-encoded, and the message keeps only the developer's words.
+CREATE TABLE IF NOT EXISTS jsan_message_images (
+  id         TEXT PRIMARY KEY,
+  message_id TEXT NOT NULL REFERENCES jsan_messages(id) ON DELETE CASCADE,
+  name       TEXT NOT NULL,
+  -- image/png, image/jpeg, image/webp or image/gif; the server rejects the rest.
+  mime       TEXT NOT NULL,
+  -- base64 payload only, with no `data:` prefix; the prefix is rebuilt on use.
+  data       TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS jsan_message_images_message_idx
+  ON jsan_message_images(message_id);
+
 CREATE INDEX IF NOT EXISTS jsan_conversations_user_updated_idx
   ON jsan_conversations(user_id, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS jsan_messages_conversation_created_idx
   ON jsan_messages(conversation_id, created_at);
 
-INSERT INTO jsan_schema_meta(key, value) VALUES ('schema_version', '1')
-  ON CONFLICT(key) DO NOTHING;
+-- Updated rather than left alone, so a database created before the image table
+-- existed reports the version it has actually been migrated to.
+INSERT INTO jsan_schema_meta(key, value) VALUES ('schema_version', '2')
+  ON CONFLICT(key) DO UPDATE SET value = excluded.value;
