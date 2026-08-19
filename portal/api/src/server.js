@@ -4,14 +4,13 @@ import cookieParser from 'cookie-parser';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
-import pg from 'pg';
 import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Readable } from 'stream';
 import { createDocumentRoutes } from './documents/routes.js';
+import { createStore, resolveDriver } from './store/index.js';
 
-const { Pool } = pg;
 const app = express();
 app.set('trust proxy', 1);
 
@@ -45,11 +44,11 @@ const SYSTEM_PROMPT = `You are JSAN Dev AI, a senior software engineering copilo
 const DEV_MONTHLY_BUDGET = Number(process.env.DEVELOPER_MONTHLY_BUDGET_USD || 0);
 const DEV_RPM_LIMIT = Number(process.env.DEVELOPER_RPM_LIMIT || 0);
 const DEV_TPM_LIMIT = Number(process.env.DEVELOPER_TPM_LIMIT || 0);
-const pool = PREVIEW_MODE ? null : new Pool({ connectionString: process.env.DATABASE_URL });
-
-if (!PREVIEW_MODE && !String(process.env.DATABASE_URL || '').trim()) {
-  throw new Error('DATABASE_URL must be configured. To run the portal before Postgres is provisioned, set AUTH_DISABLED=true for preview mode.');
-}
+// Storage. The driver (postgres | sqlite | memory) is chosen in ./store, and is
+// opened during boot() below — every use of it happens inside a request handler,
+// which runs long after that.
+let store = null;
+const DB_DRIVER = PREVIEW_MODE ? 'memory' : resolveDriver();
 
 function requireSecret(name) {
   const value = String(process.env[name] || '').trim();
@@ -145,153 +144,7 @@ const registerLimiter = rateLimit({
   message: { error: 'Too many registration attempts from this network. Try again later.' }
 });
 
-async function initDb() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS jsan_users (
-      id UUID PRIMARY KEY,
-      name TEXT NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      litellm_user_id TEXT UNIQUE NOT NULL,
-      litellm_key_ciphertext TEXT NOT NULL,
-      litellm_key_iv TEXT NOT NULL,
-      litellm_key_tag TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      last_login_at TIMESTAMPTZ
-    );
-    CREATE TABLE IF NOT EXISTS jsan_conversations (
-      id UUID PRIMARY KEY,
-      user_id UUID NOT NULL REFERENCES jsan_users(id) ON DELETE CASCADE,
-      title TEXT NOT NULL,
-      mode TEXT NOT NULL DEFAULT 'auto',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS jsan_messages (
-      id UUID PRIMARY KEY,
-      conversation_id UUID NOT NULL REFERENCES jsan_conversations(id) ON DELETE CASCADE,
-      role TEXT NOT NULL CHECK (role IN ('user','assistant')),
-      content TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS jsan_conversations_user_updated_idx ON jsan_conversations(user_id, updated_at DESC);
-    CREATE INDEX IF NOT EXISTS jsan_messages_conversation_created_idx ON jsan_messages(conversation_id, created_at);
-  `);
-}
 
-// Conversation storage.
-//
-// Both stores return the same row shapes, so the routes below — and the web app
-// reading them — do not change when the database arrives. The memory store only
-// exists to give preview mode enough continuity for multi-turn chat: the model
-// needs the earlier turns replayed to it, and that history has to live
-// somewhere. It is per-process and deliberately bounded.
-const pgStore = {
-  async listConversations(userId) {
-    const r = await pool.query('SELECT id,title,mode,created_at,updated_at FROM jsan_conversations WHERE user_id=$1 ORDER BY updated_at DESC LIMIT 60', [userId]);
-    return r.rows;
-  },
-  async getConversation(id, userId) {
-    const r = await pool.query('SELECT * FROM jsan_conversations WHERE id=$1 AND user_id=$2', [id, userId]);
-    return r.rows[0] || null;
-  },
-  // No limit means the whole thread, which is what reading a conversation wants.
-  // A limit means the MOST RECENT n turns, returned oldest-first for the model.
-  // Taking the oldest n instead would freeze the context: past n messages the
-  // model would never again see what the developer just typed.
-  async getMessages(conversationId, limit) {
-    if (!limit) {
-      const r = await pool.query('SELECT id,role,content,created_at FROM jsan_messages WHERE conversation_id=$1 ORDER BY created_at ASC', [conversationId]);
-      return r.rows;
-    }
-    const r = await pool.query(
-      `SELECT id,role,content,created_at FROM (
-         SELECT id,role,content,created_at FROM jsan_messages WHERE conversation_id=$1 ORDER BY created_at DESC LIMIT $2
-       ) recent ORDER BY created_at ASC`,
-      [conversationId, limit]
-    );
-    return r.rows;
-  },
-  async deleteMessage(id) {
-    await pool.query('DELETE FROM jsan_messages WHERE id=$1', [id]);
-  },
-  async deleteConversation(id, userId) {
-    await pool.query('DELETE FROM jsan_conversations WHERE id=$1 AND user_id=$2', [id, userId]);
-  },
-  async createConversation({ id, userId, title, mode }) {
-    await pool.query('INSERT INTO jsan_conversations(id,user_id,title,mode) VALUES($1,$2,$3,$4)', [id, userId, title, mode]);
-  },
-  async touchConversation(id, mode) {
-    if (mode) await pool.query('UPDATE jsan_conversations SET mode=$1,updated_at=NOW() WHERE id=$2', [mode, id]);
-    else await pool.query('UPDATE jsan_conversations SET updated_at=NOW() WHERE id=$1', [id]);
-  },
-  // Returns the new id so a caller can undo the write if what follows fails.
-  async addMessage({ conversationId, role, content }) {
-    const id = crypto.randomUUID();
-    await pool.query('INSERT INTO jsan_messages(id,conversation_id,role,content) VALUES($1,$2,$3,$4)', [id, conversationId, role, content]);
-    return id;
-  }
-};
-
-const MEMORY_CONVERSATION_LIMIT = 60;
-const MEMORY_MESSAGE_LIMIT = 200;
-const memoryConversations = new Map();
-const memoryMessages = new Map();
-
-const memoryStore = {
-  async listConversations(userId) {
-    return [...memoryConversations.values()]
-      .filter(c => c.user_id === userId)
-      .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
-      .map(({ user_id, ...row }) => row);
-  },
-  async getConversation(id, userId) {
-    const c = memoryConversations.get(id);
-    return c && c.user_id === userId ? c : null;
-  },
-  async getMessages(conversationId, limit) {
-    const list = memoryMessages.get(conversationId) || [];
-    return limit ? list.slice(-limit) : [...list];
-  },
-  async deleteMessage(id) {
-    for (const [cid, list] of memoryMessages) {
-      const at = list.findIndex(m => m.id === id);
-      if (at !== -1) { list.splice(at, 1); memoryMessages.set(cid, list); return; }
-    }
-  },
-  async deleteConversation(id, userId) {
-    if (memoryConversations.get(id)?.user_id !== userId) return;
-    memoryConversations.delete(id);
-    memoryMessages.delete(id);
-  },
-  async createConversation({ id, userId, title, mode }) {
-    const now = new Date().toISOString();
-    memoryConversations.set(id, { id, user_id: userId, title, mode, created_at: now, updated_at: now });
-    memoryMessages.set(id, []);
-    // Oldest first in insertion order, so the front of the map is what to drop.
-    while (memoryConversations.size > MEMORY_CONVERSATION_LIMIT) {
-      const oldest = memoryConversations.keys().next().value;
-      memoryConversations.delete(oldest);
-      memoryMessages.delete(oldest);
-    }
-  },
-  async touchConversation(id, mode) {
-    const c = memoryConversations.get(id);
-    if (!c) return;
-    if (mode) c.mode = mode;
-    c.updated_at = new Date().toISOString();
-  },
-  async addMessage({ conversationId, role, content }) {
-    const list = memoryMessages.get(conversationId);
-    if (!list) return null;
-    const id = crypto.randomUUID();
-    list.push({ id, role, content, created_at: new Date().toISOString() });
-    if (list.length > MEMORY_MESSAGE_LIMIT) list.splice(0, list.length - MEMORY_MESSAGE_LIMIT);
-    return id;
-  }
-};
-
-const store = PREVIEW_MODE ? memoryStore : pgStore;
 
 function previewUnavailable(res, what) {
   return res.status(503).json({ error: `${what} needs the database, which is not provisioned yet.` });
@@ -365,7 +218,25 @@ async function litellmFetch(endpoint, { method = 'GET', body, key = LITELLM_MAST
  * model call itself and never hands a key to a browser.
  */
 function modelKeyFor(user) {
-  return PREVIEW_MODE ? LITELLM_MASTER_KEY : decryptKey(user);
+  if (PREVIEW_MODE) return LITELLM_MASTER_KEY;
+  // A developer registered while the gateway had no key store has no personal
+  // key to decrypt. Their chat still works on the gateway key, which stays
+  // server-side. Only an absent key falls back — a key that fails to decrypt
+  // still raises, because that means something is wrong rather than pending.
+  if (!user?.litellm_key_ciphertext) return LITELLM_MASTER_KEY;
+  return decryptKey(user);
+}
+
+/** True when this developer has a personal key of their own. */
+function hasPersonalKey(user) {
+  return !!user?.litellm_key_ciphertext;
+}
+
+function personalKeyPending(res) {
+  return res.status(503).json({
+    error: 'Your personal developer key has not been issued yet. The AI gateway needs its own database before it can create per-developer keys — chat and slides work in the meantime.',
+    reason: 'personal-key-pending'
+  });
 }
 
 /** One chat completion through the gateway. Shared by chat and document generation. */
@@ -382,7 +253,26 @@ async function callModel({ key, model, messages, user, timeout = 120000 }) {
   return data.choices?.[0]?.message?.content || '';
 }
 
+/**
+ * Ask the gateway for a personal virtual key for a new developer.
+ *
+ * LiteLLM keeps its virtual keys in its own Postgres database, so a gateway
+ * running without one — the normal case while the portal is on local SQLite —
+ * cannot issue them. That must not block registration: the account is created
+ * with no stored key, the developer's model calls fall back to the gateway key
+ * held server-side, and the Tools page tells them the personal key is pending.
+ * `key: null` is the signal for all of that.
+ */
 async function provisionLiteLLMUser({ id, name, email }) {
+  try {
+    return await issueLiteLLMKey({ id, name, email });
+  } catch (error) {
+    console.warn(`LiteLLM could not issue a personal key for ${email}: ${error.message}`);
+    return { litellmUserId: id, key: null };
+  }
+}
+
+async function issueLiteLLMKey({ id, name, email }) {
   const userResult = await litellmFetch('/user/new', {
     method: 'POST',
     body: { user_id: id, user_email: email, user_alias: name, user_role: 'internal_user' }
@@ -407,8 +297,7 @@ async function provisionLiteLLMUser({ id, name, email }) {
 }
 
 async function getUserById(id) {
-  const r = await pool.query('SELECT * FROM jsan_users WHERE id=$1', [id]);
-  return r.rows[0] || null;
+  return await store.findUserById(id);
 }
 async function sessionUser(req) {
   const token = req.cookies.jsan_session;
@@ -431,8 +320,7 @@ app.get('/api/health', async (_req, res) => {
   let db = false, gateway = false, registeredUsers = 0;
   if (!PREVIEW_MODE) {
     try {
-      const c = await pool.query('SELECT COUNT(*)::int count FROM jsan_users');
-      registeredUsers = c.rows[0].count;
+      registeredUsers = await store.countUsers();
       db = true;
     } catch {}
   }
@@ -443,13 +331,12 @@ app.get('/api/health', async (_req, res) => {
   // In preview mode the database is knowingly absent, so the gateway alone
   // decides health — otherwise Railway would restart a service that is doing
   // exactly what it was configured to do.
-  res.json({ ok: PREVIEW_MODE ? gateway : (db && gateway), db, gateway, previewMode: PREVIEW_MODE, registeredUsers, maxUsers: MAX_USERS, registrationOpen: !PREVIEW_MODE && registeredUsers < MAX_USERS });
+  res.json({ ok: PREVIEW_MODE ? gateway : (db && gateway), db, driver: DB_DRIVER, gateway, previewMode: PREVIEW_MODE, registeredUsers, maxUsers: MAX_USERS, registrationOpen: !PREVIEW_MODE && registeredUsers < MAX_USERS });
 });
 
 app.get('/api/auth/registration-status', async (_req, res) => {
   if (PREVIEW_MODE) return res.json({ previewMode: true, registeredUsers: 0, maxUsers: MAX_USERS, remaining: 0, registrationOpen: false });
-  const r = await pool.query('SELECT COUNT(*)::int count FROM jsan_users');
-  const count = r.rows[0].count;
+  const count = await store.countUsers();
   res.json({ registeredUsers: count, maxUsers: MAX_USERS, remaining: Math.max(0, MAX_USERS - count), registrationOpen: count < MAX_USERS });
 });
 
@@ -466,39 +353,39 @@ app.post('/api/auth/register', registerLimiter, async (req, res) => {
   if (ALLOWED_EMAIL_DOMAIN && !email.endsWith(`@${ALLOWED_EMAIL_DOMAIN}`)) return res.status(400).json({ error: `Use your ${ALLOWED_EMAIL_DOMAIN} email` });
   if (password.length < 10) return res.status(400).json({ error: 'Use at least 10 characters for your password' });
 
-  const client = await pool.connect();
-  let provisionedKey = null;
   try {
-    await client.query('BEGIN');
-    await client.query('SELECT pg_advisory_xact_lock($1)', [20312026]);
-    const count = await client.query('SELECT COUNT(*)::int count FROM jsan_users');
-    if (count.rows[0].count >= MAX_USERS) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ error: 'Registration is full' });
-    }
-    const exists = await client.query('SELECT id FROM jsan_users WHERE email=$1', [email]);
-    if (exists.rowCount) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ error: 'An account already exists for this email' });
-    }
+    // Checked cheaply first so the common mistakes fail before doing any work.
+    // The authoritative check is inside store.createUser, which holds a lock for
+    // it — provisioning a gateway key is a network call and must not run inside
+    // that transaction, or every registration would queue behind it.
+    if (await store.findUserByEmail(email)) return res.status(409).json({ error: 'An account already exists for this email' });
+    if (await store.countUsers() >= MAX_USERS) return res.status(409).json({ error: 'Registration is full' });
 
     const id = crypto.randomUUID();
     const passwordHash = await bcrypt.hash(password, 12);
     const provision = await provisionLiteLLMUser({ id, name, email });
-    provisionedKey = provision.key;
-    const encrypted = encryptText(provision.key);
-    await client.query(`INSERT INTO jsan_users(id,name,email,password_hash,litellm_user_id,litellm_key_ciphertext,litellm_key_iv,litellm_key_tag,last_login_at)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW())`, [id, name, email, passwordHash, provision.litellmUserId, encrypted.ciphertext, encrypted.iv, encrypted.tag]);
-    await client.query('COMMIT');
+
+    const created = await store.createUser({
+      id,
+      name,
+      email,
+      passwordHash,
+      litellmUserId: provision.litellmUserId,
+      key: provision.key ? encryptText(provision.key) : null,
+      maxUsers: MAX_USERS
+    });
+    if (!created.ok) {
+      return res.status(409).json({
+        error: created.reason === 'full' ? 'Registration is full' : 'An account already exists for this email'
+      });
+    }
+
     const user = { id, name, email };
     setSessionCookie(res, createSession(user));
-    return res.status(201).json({ user });
+    return res.status(201).json({ user, personalKeyIssued: !!provision.key });
   } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
     console.error('Registration failed:', e.message);
     return res.status(502).json({ error: cleanError(e, 'Could not create the account. Please try again or contact the platform owner.') });
-  } finally {
-    client.release();
   }
 });
 
@@ -506,10 +393,9 @@ app.post('/api/auth/login', loginIpLimiter, loginAccountLimiter, async (req, res
   if (PREVIEW_MODE) return previewUnavailable(res, 'Signing in');
   const email = String(req.body?.email || '').trim().toLowerCase();
   const password = String(req.body?.password || '');
-  const r = await pool.query('SELECT * FROM jsan_users WHERE email=$1', [email]);
-  if (!r.rowCount || !(await bcrypt.compare(password, r.rows[0].password_hash))) return res.status(401).json({ error: 'Email or password is incorrect' });
-  const user = r.rows[0];
-  await pool.query('UPDATE jsan_users SET last_login_at=NOW() WHERE id=$1', [user.id]);
+  const user = await store.findUserByEmail(email);
+  if (!user || !(await bcrypt.compare(password, user.password_hash))) return res.status(401).json({ error: 'Email or password is incorrect' });
+  await store.touchLastLogin(user.id);
   setSessionCookie(res, createSession(user));
   res.json({ user: { id: user.id, name: user.name, email: user.email } });
 });
@@ -526,19 +412,21 @@ app.get('/api/me', auth, (req, res) => res.json({ id: req.user.id, name: req.use
 // would go to a browser, and it is the one credential that must not.
 app.get('/api/me/api-key', auth, (req, res) => {
   if (PREVIEW_MODE) return previewUnavailable(res, 'Your personal developer key');
+  if (!hasPersonalKey(req.user)) return personalKeyPending(res);
   try { res.json({ apiKey: decryptKey(req.user) }); }
   catch { res.status(500).json({ error: 'Could not read your developer key' }); }
 });
 
 app.post('/api/me/api-key/rotate', auth, async (req, res) => {
   if (PREVIEW_MODE) return previewUnavailable(res, 'Key rotation');
+  if (!hasPersonalKey(req.user)) return personalKeyPending(res);
   try {
     const oldKey = decryptKey(req.user);
     const result = await litellmFetch('/key/regenerate', { method: 'POST', body: { key: oldKey } });
     const newKey = result?.key || result?.token;
     if (!newKey) throw new Error('LiteLLM did not return the regenerated key');
     const encrypted = encryptText(newKey);
-    await pool.query('UPDATE jsan_users SET litellm_key_ciphertext=$1,litellm_key_iv=$2,litellm_key_tag=$3 WHERE id=$4', [encrypted.ciphertext, encrypted.iv, encrypted.tag, req.user.id]);
+    await store.updateUserKey(req.user.id, encrypted);
     res.json({ apiKey: newKey });
   } catch (e) {
     console.error('Key rotation failed:', e.message);
@@ -615,6 +503,7 @@ app.get('/api/usage/me', auth, async (req, res) => {
   // Spend is tracked against a developer's own key, so there is nothing
   // meaningful to report for a shared anonymous session.
   if (PREVIEW_MODE) return previewUnavailable(res, 'Per-developer usage');
+  if (!hasPersonalKey(req.user)) return personalKeyPending(res);
   try {
     const key = decryptKey(req.user);
     const info = await litellmFetch('/user/info', { key, timeout: 10000 });
@@ -712,12 +601,19 @@ app.use((error, _req, res, next) => {
 });
 
 async function boot() {
+  store = await createStore({ previewMode: PREVIEW_MODE });
+  await store.initSchema();
+
   if (PREVIEW_MODE) {
     console.warn('AUTH_DISABLED=true — PREVIEW MODE. No sign-in: every visitor shares one anonymous session and the gateway budget behind it.');
-    console.warn('Conversations are kept in this process only and are lost on restart. Provision Postgres and remove AUTH_DISABLED before inviting developers.');
+    console.warn('Conversations are kept in this process only and are lost on restart. Provision a database and remove AUTH_DISABLED before inviting developers.');
   } else {
-    await initDb();
+    console.log(`Storage: ${store.describe()}`);
+    if (store.driver === 'sqlite') {
+      console.warn('SQLite is a single local file — suitable for local development, not for a deployed team. Move to Postgres before inviting developers.');
+    }
   }
+
   app.listen(PORT, '0.0.0.0', () => console.log(`JSAN Dev AI listening on ${PORT}${PREVIEW_MODE ? ' (preview mode)' : ''}`));
 }
 

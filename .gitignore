@@ -5,3 +5,11 @@ portal/web/dist/
 .DS_Store
 *.pem
 *.key
+
+# Local SQLite database. Holds real password hashes and conversations — never commit it.
+portal/api/data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3

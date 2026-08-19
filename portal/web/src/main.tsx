@@ -89,7 +89,14 @@ async function api(path:string, options:RequestInit = {}) {
     headers:{ ...(options.body ? {'Content-Type':'application/json'} : {}), ...(options.headers || {}) }
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || 'Request failed');
+  if (!res.ok) {
+    // Carry the status and reason through: some non-OK replies are expected
+    // states to explain, not failures to show in red.
+    const error:any = new Error(data.error || 'Request failed');
+    error.status = res.status;
+    error.reason = data.reason;
+    throw error;
+  }
   return data;
 }
 
@@ -348,17 +355,29 @@ function Chat({newChatToken=0, hidden=false}:{newChatToken?:number; hidden?:bool
 
 function Tools({previewMode=false}:{previewMode?:boolean}) {
   const [key,setKey] = useState(''); const [cfg,setCfg] = useState<any>(null); const [show,setShow] = useState(false); const [busy,setBusy] = useState(false); const [error,setError] = useState('');
+  // Signed in, but the gateway has not issued this developer a personal key yet.
+  const [keyPending,setKeyPending] = useState(false);
   // The endpoint snippets are the same for everyone, so they still load in
   // preview mode. Only the personal key needs an account behind it.
   useEffect(()=>{api('/api/tools/config').then(setCfg).catch(e=>setError(e.message))},[]);
-  useEffect(()=>{if(previewMode)return;api('/api/me/api-key').then(k=>setKey(k.apiKey)).catch(e=>setError(e.message))},[previewMode]);
+  useEffect(()=>{
+    if(previewMode)return;
+    api('/api/me/api-key')
+      .then(k=>{setKey(k.apiKey);setKeyPending(false)})
+      .catch((e:any)=>{ if(e.reason==='personal-key-pending') setKeyPending(true); else setError(e.message) });
+  },[previewMode]);
   const rotate=async()=>{if(!confirm('Rotate your developer key? Tools using the old key will stop working.'))return;setBusy(true);setError('');try{const d=await api('/api/me/api-key/rotate',{method:'POST'});setKey(d.apiKey)}catch(e:any){setError(e.message)}finally{setBusy(false)}};
   return <div className="page">
     <header className="page-header"><div><span className="eyebrow">Developer tools</span><h1>Take the same AI into your editor.</h1><p>Use one JSAN endpoint and your personal key across supported coding tools.</p></div><div className="header-badge"><span/><strong>Gateway ready</strong></div></header>
     {error&&<div className="page-error">{error}</div>}
     <div className="content-grid">
-      {previewMode
-        ? <section className="card span-2"><div className="card-head simple"><div><div className="card-icon"><KeyRound size={17}/></div><div><h2>Your developer key</h2><p>Keys are issued per account, so this waits on the database. The endpoint below is already live — it just needs a key to authenticate with.</p></div></div></div><div className="preview-notice"><Wrench size={13}/><span>Available as soon as Postgres is provisioned and sign-in is switched back on.</span></div></section>
+      {previewMode || keyPending
+        ? <section className="card span-2"><div className="card-head simple"><div><div className="card-icon"><KeyRound size={17}/></div><div><h2>Your developer key</h2><p>{previewMode
+            ? 'Keys are issued per account, so this waits on the database. The endpoint below is already live — it just needs a key to authenticate with.'
+            : 'Your account exists, but the AI gateway has not issued your personal key yet. Chat and Slides work in the meantime — they call the gateway from the server.'}</p></div></div></div>
+          <div className="preview-notice"><Wrench size={13}/><span>{previewMode
+            ? 'Available as soon as Postgres is provisioned and sign-in is switched back on.'
+            : 'The gateway needs its own database before it can create per-developer keys. Your key appears here once it can.'}</span></div></section>
         : <section className="card span-2 key-card"><div className="card-head"><div><div className="card-icon"><KeyRound size={17}/></div><div><h2>Your developer key</h2><p>Use it in your own tools. Keep it private.</p></div></div><button className="secondary-button" onClick={rotate} disabled={busy}><RotateCcw size={14}/>{busy?'Rotating…':'Rotate key'}</button></div><div className="key-box"><code>{show?key:key?`${key.slice(0,8)}${'•'.repeat(30)}${key.slice(-5)}`:'Loading…'}</code><button className="text-button" onClick={()=>setShow(v=>!v)}>{show?'Hide':'Show'}</button><CopyButton value={key}/></div></section>}
       <ToolCard icon={<Code2 size={17}/>} title="Codex CLI" text="Use Code mode through the JSAN gateway." value={cfg?.codex||''} note="Set JSAN_AI_KEY to your developer key."/>
       <ToolCard icon={<Sparkles size={17}/>} title="Claude Code" text="Route Claude Code through the same gateway." value={cfg?.claude||''} note="Use your developer key as the Anthropic auth token."/>
@@ -624,14 +643,25 @@ function SlidesPage() {
 
 function UsagePage({previewMode=false}:{previewMode?:boolean}) {
   const [data,setData] = useState<Usage|null>(null); const [error,setError] = useState('');
-  // Spend is tracked per developer key, so a shared anonymous session has no
-  // usage of its own to show.
-  useEffect(()=>{if(previewMode)return;api('/api/usage/me').then(setData).catch(e=>setError(e.message))},[previewMode]);
+  const [keyPending,setKeyPending] = useState(false);
+  // Spend is tracked per developer key, so a shared anonymous session — or an
+  // account whose key has not been issued — has no usage of its own to show.
+  useEffect(()=>{
+    if(previewMode)return;
+    api('/api/usage/me').then(setData)
+      .catch((e:any)=>{ if(e.reason==='personal-key-pending') setKeyPending(true); else setError(e.message) });
+  },[previewMode]);
   const pct = useMemo(()=>data?.maxBudget ? Math.min(100,(data.spend/data.maxBudget)*100) : 0,[data]);
   return <div className="page">
     <header className="page-header"><div><span className="eyebrow">Usage</span><h1>Simple visibility, no guesswork.</h1><p>See the access attached to your developer key without worrying about provider-level details.</p></div></header>
     {error&&<div className="page-error">{error}</div>}
-    {previewMode?<div className="content-grid"><section className="card span-2"><div className="card-head simple"><div><div className="card-icon"><Gauge size={17}/></div><div><h2>Usage tracking is per developer</h2><p>Each account gets its own key, and spend is measured against it. Preview mode shares one anonymous session, so there is nothing individual to report yet.</p></div></div></div><div className="preview-notice"><Wrench size={13}/><span>Provision Postgres and turn sign-in back on to see per-developer spend and budgets.</span></div></section></div>
+    {previewMode || keyPending
+      ?<div className="content-grid"><section className="card span-2"><div className="card-head simple"><div><div className="card-icon"><Gauge size={17}/></div><div><h2>Usage tracking is per developer</h2><p>{previewMode
+        ? 'Each account gets its own key, and spend is measured against it. Preview mode shares one anonymous session, so there is nothing individual to report yet.'
+        : 'Spend is measured against your personal gateway key, which has not been issued yet, so there is nothing individual to report.'}</p></div></div></div>
+        <div className="preview-notice"><Wrench size={13}/><span>{previewMode
+          ? 'Provision Postgres and turn sign-in back on to see per-developer spend and budgets.'
+          : 'Once the gateway has its own database and issues your key, spend and budgets appear here.'}</span></div></section></div>
      :!data?<div className="skeleton"/>:<div className="content-grid">
       <section className="metric-card"><span>Current spend</span><strong>${data.spend.toFixed(2)}</strong><small>{data.budgetDuration?'Current budget period':'Tracked by the gateway'}</small></section>
       <section className="metric-card"><span>Personal budget</span><strong>{data.maxBudget==null?'Flexible':`$${data.maxBudget.toFixed(2)}`}</strong><small>{data.maxBudget==null?'No personal cap configured':`${Math.max(0,100-pct).toFixed(0)}% remaining`}</small></section>
