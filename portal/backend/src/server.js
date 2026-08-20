@@ -68,6 +68,23 @@ const DEV_MONTHLY_BUDGET = Number(process.env.DEVELOPER_MONTHLY_BUDGET_USD || 0)
 const DEV_RPM_LIMIT = Number(process.env.DEVELOPER_RPM_LIMIT || 0);
 const DEV_TPM_LIMIT = Number(process.env.DEVELOPER_TPM_LIMIT || 0);
 
+// Accounts that must exist on every run.
+//
+// Registering through the form is how a developer gets a seat, but it is a
+// one-time act against whichever database happened to be mounted at the time.
+// Reset the file, deploy without a volume, or start on a second machine and the
+// account is gone with it. The accounts this portal is operated with cannot
+// depend on that, so they are declared as configuration and reconciled at boot
+// rather than typed into the form once and hoped for.
+//
+// SEED_ACCOUNTS is a JSON array of {name, email, password}. Seeding does not go
+// through /api/auth/register and so is not subject to the access code or
+// ALLOWED_EMAIL_DOMAIN: both exist to control who may claim a seat from
+// outside, and this list is the operator stating who already holds one. The
+// accounts do still occupy seats once created, so MAX_USERS closes public
+// registration that much earlier, which is the intended reading of the cap.
+const SEED_ACCOUNTS = parseSeedAccounts(process.env.SEED_ACCOUNTS);
+
 // Chat streaming budgets.
 //
 // A single wall-clock deadline cannot serve both cases here: a real engineering
@@ -94,6 +111,36 @@ function requireSecret(name) {
   const value = String(process.env[name] || '').trim();
   if (!value || value.includes('change-me')) throw new Error(`${name} must be configured`);
   return value;
+}
+
+/**
+ * Read and validate SEED_ACCOUNTS. Throws rather than skipping a malformed
+ * entry: a seeded account that silently fails to appear looks exactly like a
+ * forgotten password to whoever tries to sign in with it, and the portal
+ * already refuses to boot on unusable configuration (see requireSecret).
+ */
+function parseSeedAccounts(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return [];
+  let entries;
+  try { entries = JSON.parse(text); }
+  catch { throw new Error('SEED_ACCOUNTS must be a JSON array of {name, email, password}'); }
+  if (!Array.isArray(entries)) throw new Error('SEED_ACCOUNTS must be a JSON array of {name, email, password}');
+  const seen = new Set();
+  return entries.map((entry, index) => {
+    const at = `SEED_ACCOUNTS[${index}]`;
+    const name = String(entry?.name || '').trim();
+    const email = String(entry?.email || '').trim().toLowerCase();
+    const password = String(entry?.password || '');
+    if (name.length < 2 || name.length > 80) throw new Error(`${at} needs a name`);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error(`${at} needs a valid email`);
+    // The floor the registration form enforces, applied here too so a declared
+    // account is never weaker than one somebody signed up for.
+    if (password.length < 10) throw new Error(`${at} needs a password of at least 10 characters`);
+    if (seen.has(email)) throw new Error(`${at} repeats ${email}`);
+    seen.add(email);
+    return { name, email, password };
+  });
 }
 
 app.use(cookieParser());
@@ -248,15 +295,41 @@ async function litellmFetch(endpoint, { method = 'GET', body, key = LITELLM_MAST
   return data;
 }
 
+/** The user id LiteLLM already holds for an address. */
+async function findLiteLLMUserId(email) {
+  const found = await litellmFetch(`/user/list?user_email=${encodeURIComponent(email)}`);
+  const match = (found?.users || []).find((u) => String(u?.user_email || '').toLowerCase() === email);
+  if (!match?.user_id) throw new Error(`LiteLLM reports ${email} already exists but did not return its user id`);
+  return match.user_id;
+}
+
+// LiteLLM keeps its own database, and it is not the portal's. On Railway it is
+// a managed Postgres that outlives the SQLite volume; locally it is a container
+// volume that outlives the file. So an account this portal has no row for can
+// still be present upstream — after a database reset, a redeploy onto an empty
+// volume, or a seeded account arriving on a fresh machine — and both halves of
+// provisioning refuse it: /user/new rejects the duplicate email, and
+// /key/generate rejects the duplicate alias, which LiteLLM requires to be
+// unique across every key it holds. Neither is a reason to fail, because what
+// actually grants access is the key, and a new one is issued either way.
 async function provisionLiteLLMUser({ id, name, email }) {
-  const userResult = await litellmFetch('/user/new', {
-    method: 'POST',
-    body: { user_id: id, user_email: email, user_alias: name, user_role: 'internal_user' }
-  });
-  const litellmUserId = userResult?.user_id || id;
+  const keyAlias = `jsan-${email}`;
+  let litellmUserId = id;
+  try {
+    const userResult = await litellmFetch('/user/new', {
+      method: 'POST',
+      body: { user_id: id, user_email: email, user_alias: name, user_role: 'internal_user' }
+    });
+    litellmUserId = userResult?.user_id || id;
+  } catch (e) {
+    if (!/already exists/i.test(String(e.message))) throw e;
+    litellmUserId = await findLiteLLMUserId(email);
+    console.log(`Adopted the LiteLLM user already registered for ${email}`);
+  }
+
   const keyBody = {
     user_id: litellmUserId,
-    key_alias: `jsan-${email}`,
+    key_alias: keyAlias,
     models: KEY_MODELS,
     metadata: { app: 'jsan-dev-ai', email }
   };
@@ -266,7 +339,21 @@ async function provisionLiteLLMUser({ id, name, email }) {
   }
   if (DEV_RPM_LIMIT > 0) keyBody.rpm_limit = DEV_RPM_LIMIT;
   if (DEV_TPM_LIMIT > 0) keyBody.tpm_limit = DEV_TPM_LIMIT;
-  const keyResult = await litellmFetch('/key/generate', { method: 'POST', body: keyBody });
+
+  let keyResult;
+  try {
+    keyResult = await litellmFetch('/key/generate', { method: 'POST', body: keyBody });
+  } catch (e) {
+    if (!/alias.*already exists/i.test(String(e.message))) throw e;
+    // The key issued for this address last time still holds the alias. It can
+    // never be handed back - its plaintext lived only in the row that is gone,
+    // and the portal stores nothing it can decrypt any more - so retire it and
+    // issue a fresh one. That is what /api/me/api-key/rotate does to a key it
+    // is replacing, and it leaves one live key per account either way.
+    await litellmFetch('/key/delete', { method: 'POST', body: { key_aliases: [keyAlias] } });
+    console.log(`Retired the unreachable key previously issued to ${email}`);
+    keyResult = await litellmFetch('/key/generate', { method: 'POST', body: keyBody });
+  }
   const key = keyResult?.key || keyResult?.token;
   if (!key) throw new Error('LiteLLM did not return a virtual key');
   return { litellmUserId, key };
@@ -865,8 +952,59 @@ async function widenKeyScopes() {
   console.log(`Developer keys scoped to [${KEY_MODELS.join(', ')}]: ${updated}/${users.length}`);
 }
 
-app.listen(PORT, '0.0.0.0', () => {
+// Bring the declared accounts into existence, and back into agreement with the
+// configured password where they have drifted from it. Same contract as
+// widenKeyScopes: runs once at boot, is idempotent, and logs a failure rather
+// than raising it, since the rest of the portal works without it and the next
+// boot tries again — which matters because LiteLLM may still be starting.
+//
+// The password is reapplied rather than left alone because this portal has no
+// change-password route: configuration is the only source of truth for these
+// accounts, so agreeing with it is what makes the credentials work on every
+// run instead of only on the one where the row was first written.
+async function ensureSeedAccounts() {
+  if (!SEED_ACCOUNTS.length) return;
+  let created = 0, restored = 0, failed = 0;
+  for (const account of SEED_ACCOUNTS) {
+    try {
+      const existing = db.prepare('SELECT * FROM jsan_users WHERE email=?').get(account.email);
+      if (existing) {
+        if (await bcrypt.compare(account.password, existing.password_hash)) continue;
+        db.prepare('UPDATE jsan_users SET password_hash=? WHERE id=?')
+          .run(await bcrypt.hash(account.password, 12), existing.id);
+        restored++;
+        console.log(`Seed account ${account.email}: password restored from configuration`);
+        continue;
+      }
+      const id = crypto.randomUUID();
+      const provision = await provisionLiteLLMUser({ id, name: account.name, email: account.email });
+      try {
+        const passwordHash = await bcrypt.hash(account.password, 12);
+        const encrypted = encryptText(provision.key);
+        db.prepare(`INSERT INTO jsan_users(id,name,email,password_hash,litellm_user_id,litellm_key_ciphertext,litellm_key_iv,litellm_key_tag)
+          VALUES(?,?,?,?,?,?,?,?)`)
+          .run(id, account.name, account.email, passwordHash, provision.litellmUserId,
+               encrypted.ciphertext, encrypted.iv, encrypted.tag);
+      } catch (e) {
+        // The virtual key exists by this point; an insert that fails would
+        // otherwise leave it usable with no account behind it.
+        await revokeLiteLLMUser(provision);
+        throw e;
+      }
+      created++;
+      console.log(`Seed account ${account.email}: created`);
+    } catch (e) {
+      failed++;
+      console.error(`Could not reconcile the seed account ${account.email}:`, e.message);
+    }
+  }
+  console.log(`Seed accounts: ${SEED_ACCOUNTS.length} declared, ${created} created, ${restored} restored, ${failed} failed`);
+}
+
+app.listen(PORT, '0.0.0.0', async () => {
   console.log(`JSAN Dev AI listening on ${PORT} - database ${databasePath()}`);
   // After listen, never before it: the healthcheck must not wait on LiteLLM.
+  // Seeding runs first so an account created now is counted by the scope pass.
+  await ensureSeedAccounts();
   widenKeyScopes();
 });
