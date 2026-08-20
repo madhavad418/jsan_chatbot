@@ -9,6 +9,7 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Readable } from 'stream';
+import { createDocumentRoutes } from './documents/routes.js';
 
 // Resolve .env from this file's location rather than the working directory, so
 // the server loads the same configuration whether it is started from portal/,
@@ -184,6 +185,18 @@ const chatLimiter = rateLimit({
   message: { error: 'You are sending messages too quickly. Wait a moment and try again.' }
 });
 
+// Documents: per developer, like chat. A conversion is a PDF parse plus a
+// model call, so it costs far more than a chat turn and is allowed
+// correspondingly less often.
+const documentLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: 12,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.id ?? byIp(req),
+  message: { error: 'Too many conversions in a row. Wait a few minutes and try again.' }
+});
+
 // Login, per account: deliberately not a rate limiter. A fixed number of tries
 // followed by a fixed cool-off is a lockout, and this store keeps its counters
 // in memory — a restart, or a Railway deploy mid-attack, would hand the
@@ -311,6 +324,26 @@ async function findLiteLLMUserId(email) {
 // /key/generate rejects the duplicate alias, which LiteLLM requires to be
 // unique across every key it holds. Neither is a reason to fail, because what
 // actually grants access is the key, and a new one is issued either way.
+/**
+ * One non-streaming call to the gateway, on a developer's own virtual key.
+ *
+ * /api/chat streams because somebody is watching the answer arrive. The deck
+ * planner is not: it waits on a single JSON object and has nothing to show
+ * until that object is complete, so it wants the whole reply or an error.
+ */
+async function callModel({ key, model, messages, user, timeout = 120000 }) {
+  const upstream = await fetch(`${LITELLM_BASE_URL}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+    body: JSON.stringify({ model, messages, ...(user ? { user } : {}) }),
+    signal: AbortSignal.timeout(timeout)
+  });
+  const raw = await upstream.text();
+  let data; try { data = JSON.parse(raw); } catch { data = {}; }
+  if (!upstream.ok) throw new Error(data?.error?.message || data?.detail?.error || raw.slice(0, 500));
+  return data.choices?.[0]?.message?.content || '';
+}
+
 async function provisionLiteLLMUser({ id, name, email }) {
   const keyAlias = `jsan-${email}`;
   let litellmUserId = id;
@@ -995,6 +1028,21 @@ app.get('/api/tools/config', auth, (_req, res) => {
     curl: `curl ${base}/v1/models -H "Authorization: Bearer <your developer key>"`
   });
 });
+
+// Document generation (PDF -> PPTX today). Auth, metering and the model call
+// are injected so the feature stays self-contained under src/documents and can
+// be given a second generator without either file knowing about the other.
+//
+// modelKeyFor is decryptKey unchanged: every account here holds a personal
+// virtual key - registration fails rather than writing a row without one - so a
+// conversion is metered against the developer who asked for it, exactly as
+// their chat turns are. The key is read server-side and never leaves it.
+app.use('/api/documents', createDocumentRoutes({
+  auth,
+  limiter: documentLimiter,
+  callModel,
+  modelKeyFor: decryptKey
+}));
 
 const staticDir = path.resolve(__dirname, '../../frontend/dist');
 // Public developer API edge. LiteLLM itself stays private on Railway.

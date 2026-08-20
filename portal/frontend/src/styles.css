@@ -301,3 +301,103 @@
 [data-theme="dark"] .field-hint{color:#f0968c}
 @keyframes modal-fade{from{opacity:0}}
 @keyframes modal-pop{from{opacity:0;transform:translateY(6px) scale(.985)}}
+
+/* ---------- Slides: PDF to editable PowerPoint ---------- */
+.dropzone{
+  width:100%;margin-top:16px;padding:26px 18px;
+  border:1.5px dashed var(--line2);border-radius:12px;background:var(--panel2);
+  display:flex;flex-direction:column;align-items:center;gap:7px;text-align:center;
+  transition:.16s;
+}
+.dropzone:hover,.dropzone.is-dragging{border-color:var(--accent);background:color-mix(in srgb,var(--soft) 55%,var(--panel))}
+.dropzone svg{color:var(--accent)}
+.dropzone strong{font-size:11px}
+.dropzone span{font-size:9px;color:var(--muted)}
+
+.chosen-file{
+  margin-top:16px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);
+  padding:9px 9px 9px 11px;display:flex;align-items:center;gap:10px;
+}
+.chosen-icon{width:28px;height:28px;flex:none;border-radius:8px;background:var(--soft);color:var(--accent);display:grid;place-items:center}
+.chosen-meta{min-width:0;flex:1;display:grid}
+.chosen-meta strong{font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chosen-meta span{font-size:9px;color:var(--muted);margin-top:2px}
+
+.template-grid{margin-top:14px;display:grid;gap:7px}
+.template-option{
+  border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:9px 10px;
+  display:grid;grid-template-columns:auto minmax(0,1fr) 16px;align-items:center;gap:10px;text-align:left;transition:.16s;
+}
+.template-option:hover:not(:disabled){border-color:var(--line2);background:var(--panel2)}
+/* Selected has to win while the pointer is still resting on the option it just
+   clicked, so it is stated for the hover case too — `:hover:not(:disabled)`
+   outranks a bare class on its own. */
+.template-option.selected,
+.template-option.selected:hover{border-color:var(--accent);background:color-mix(in srgb,var(--soft) 60%,var(--panel))}
+.template-option.selected svg{color:var(--accent)}
+.template-option:disabled{opacity:.55}
+.swatch{display:flex;gap:2px;flex:none}
+.swatch i{width:9px;height:20px;border-radius:3px;display:block;border:1px solid rgba(0,0,0,.08)}
+.template-meta{min-width:0;display:grid}
+.template-meta strong{font-size:10px}
+.template-meta span{font-size:9px;color:var(--muted);margin-top:3px;line-height:1.45}
+
+.switch-row{margin-top:14px;display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px;align-items:start;cursor:pointer}
+.switch-row input{position:absolute;opacity:0;width:0;height:0}
+.switch{width:34px;height:20px;border-radius:999px;background:var(--line2);position:relative;transition:.16s;flex:none;margin-top:1px}
+.switch::after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:var(--panel);transition:.16s;box-shadow:0 1px 3px rgba(17,25,43,.2)}
+.switch-row input:checked + .switch{background:var(--accent)}
+.switch-row input:checked + .switch::after{transform:translateX(14px)}
+.switch-row input:focus-visible + .switch{outline:2px solid var(--jsan-blue);outline-offset:2px}
+.switch-text{display:grid}
+.switch-text strong{font-size:10px}
+.switch-text span{font-size:9px;color:var(--muted);margin-top:3px;line-height:1.5}
+
+.convert-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.convert-hint{font-size:9px;color:var(--muted)}
+.spin{animation:spin .9s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+.stepper{list-style:none;margin:16px 0 0;padding:0;display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.stepper li{display:flex;align-items:center;gap:7px;font-size:9px;color:var(--muted);min-width:0}
+.stepper li span:last-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.step-dot{
+  width:19px;height:19px;flex:none;border-radius:50%;display:grid;place-items:center;
+  border:1px solid var(--line2);background:var(--panel2);font-size:8px;font-weight:750;
+}
+.stepper li.is-active{color:var(--text)}
+.stepper li.is-active .step-dot{border-color:var(--accent);color:var(--accent)}
+.stepper li.is-done{color:var(--text)}
+.stepper li.is-done .step-dot{background:var(--accent);border-color:var(--accent);color:#fff}
+
+.deck-result .card-head{align-items:flex-start}
+.deck-stats{margin-top:18px;display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.deck-stats>div{border:1px solid var(--line);border-radius:10px;background:var(--panel2);padding:11px}
+.deck-stats strong{display:block;font-size:18px;letter-spacing:-.03em}
+.deck-stats span{display:block;font-size:8px;color:var(--muted);margin-top:4px}
+.slide-list{margin-top:12px;display:flex;flex-wrap:wrap;gap:6px}
+.slide-list>span{
+  display:inline-flex;align-items:center;gap:6px;max-width:100%;
+  border:1px solid var(--line);border-radius:999px;background:var(--panel);
+  padding:5px 10px 5px 6px;font-size:9px;color:var(--muted);
+}
+.slide-list b{
+  width:16px;height:16px;flex:none;border-radius:50%;background:var(--soft);color:var(--accent);
+  display:grid;place-items:center;font-size:8px;
+}
+.deck-warnings{
+  margin-top:14px;display:flex;gap:8px;align-items:flex-start;
+  border:1px dashed var(--line2);border-radius:10px;background:var(--panel2);padding:10px 11px;
+}
+.deck-warnings svg{flex:none;margin-top:1px;color:#b16a11}
+.deck-warnings p{margin:0;font-size:9px;color:var(--muted);line-height:1.55}
+.deck-warnings p + p{margin-top:5px}
+
+@media(max-width:1000px){
+  .stepper{grid-template-columns:1fr 1fr}
+  .deck-stats{grid-template-columns:1fr 1fr}
+}
+@media(max-width:640px){
+  .stepper{grid-template-columns:1fr}
+  .deck-result .card-head{flex-direction:column}
+}

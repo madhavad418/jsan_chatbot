@@ -6,7 +6,8 @@ import {
   ArrowUp, Check, ChevronDown, Code2, Copy, Download, Gauge, KeyRound, LogOut,
   Menu, MessageSquarePlus, Moon, Paperclip, RotateCcw, Search, Sparkles, Square,
   Sun, Terminal, Trash2, Wrench, X, Zap, BrainCircuit, Bug, GitPullRequest,
-  Blocks, BookOpenText, ShieldCheck, ExternalLink, CheckCircle2, Lock, TriangleAlert
+  Blocks, BookOpenText, ShieldCheck, ExternalLink, CheckCircle2, Lock, TriangleAlert,
+  Presentation, FileUp, LoaderCircle, Palette
 } from 'lucide-react';
 import './styles.css';
 
@@ -361,7 +362,7 @@ function Auth({onReady}:{onReady:(u:User)=>void}) {
 function App() {
   const [user,setUser] = useState<User|null>(null);
   const [loading,setLoading] = useState(true);
-  const [page,setPage] = useState<'chat'|'tools'|'usage'>('chat');
+  const [page,setPage] = useState<'chat'|'slides'|'tools'|'usage'>('chat');
   const [mobileNav,setMobileNav] = useState(false);
   // Bumping this tells an already-mounted Chat to clear itself. It lives here
   // rather than in Chat because the shortcut and the button must work from
@@ -390,6 +391,7 @@ function App() {
       <button className="new-chat" onClick={startNewChat}><MessageSquarePlus size={16}/><span>New chat</span><kbd>{SHORTCUT_LABEL}</kbd></button>
       <nav>
         <button className={page==='chat'?'active':''} onClick={()=>{setPage('chat');setMobileNav(false)}}><Sparkles size={16}/><span>Chat</span></button>
+        <button className={page==='slides'?'active':''} onClick={()=>{setPage('slides');setMobileNav(false)}}><Presentation size={16}/><span>Slides</span></button>
         <button className={page==='tools'?'active':''} onClick={()=>{setPage('tools');setMobileNav(false)}}><Terminal size={16}/><span>Tools</span></button>
         <button className={page==='usage'?'active':''} onClick={()=>{setPage('usage');setMobileNav(false)}}><Gauge size={16}/><span>Usage</span></button>
       </nav>
@@ -406,6 +408,7 @@ function App() {
       {/* Chat stays mounted so switching to Tools/Usage and back keeps the
           open conversation, the draft and the scroll position. */}
       <Chat newChatToken={newChatToken} hidden={page!=='chat'}/>
+      {page==='slides' && <SlidesPage/>}
       {page==='tools' && <Tools/>}
       {page==='usage' && <UsagePage/>}
     </main>
@@ -665,6 +668,256 @@ function Tools() {
 
 function ToolCard({icon,title,text,value,note}:{icon:any;title:string;text:string;value:string;note:string}){return <section className="card"><div className="card-head simple"><div><div className="card-icon">{icon}</div><div><h2>{title}</h2><p>{text}</p></div></div></div><Snippet value={value}/><p className="card-note">{note}</p></section>}
 function Snippet({value}:{value:string}) { return <div className="snippet"><pre>{value||'Loading…'}</pre><CopyButton value={value}/></div> }
+
+type DeckTemplate = { id:string; label:string; description:string; swatch:string[] };
+type DeckResult = {
+  file:{ filename:string; base64:string; bytes:number; contentType:string };
+  deck:{ title:string; subtitle:string; slideCount:number; slideTitles:string[]; organisedBy:string; template:string };
+  source:{ pages:number; pageCount:number; headings:number; tablesCarried:number; tablesFound:number; imagesCarried:number; imagesFound:number };
+  warnings:string[];
+};
+
+const CONVERT_STEPS = [
+  {key:'extracting', label:'Reading the PDF'},
+  {key:'planning',   label:'Organising slides'},
+  {key:'building',   label:'Building the file'},
+  {key:'done',       label:'Ready to download'}
+];
+
+/** Decode without spreading: a multi-megabyte deck would blow the call stack. */
+function base64ToBytes(base64:string) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function SlidesPage() {
+  const [templates,setTemplates] = useState<DeckTemplate[]>([]);
+  const [template,setTemplate] = useState('');
+  const [limits,setLimits] = useState({maxPdfBytes:8*1024*1024, maxPages:60});
+  const [file,setFile] = useState<File|null>(null);
+  const [useAi,setUseAi] = useState(true);
+  const [stage,setStage] = useState('idle');
+  const [note,setNote] = useState('');
+  const [error,setError] = useState('');
+  const [result,setResult] = useState<DeckResult|null>(null);
+  const [dragging,setDragging] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(()=>{
+    api('/api/documents/templates')
+      .then(d=>{ setTemplates(d.templates); setTemplate(t=>t||d.defaultTemplate); setLimits({maxPdfBytes:d.maxPdfBytes, maxPages:d.maxPages}); })
+      .catch(e=>setError(e.message));
+  },[]);
+
+  const busy = stage!=='idle' && stage!=='done' && stage!=='failed';
+  const maxMb = Math.round(limits.maxPdfBytes/1024/1024);
+
+  // Everything is checked before upload too, so an obvious mistake costs no round trip.
+  const choose = (picked?:File|null) => {
+    setError(''); setResult(null); setStage('idle'); setNote('');
+    if (!picked) return;
+    if (!(picked.type === 'application/pdf' || /\.pdf$/i.test(picked.name))) {
+      setError(`${picked.name} is not a PDF. Choose a file that ends in .pdf.`); return;
+    }
+    if (!picked.size) { setError(`${picked.name} is empty.`); return; }
+    if (picked.size > limits.maxPdfBytes) {
+      setError(`${picked.name} is ${(picked.size/1024/1024).toFixed(1)} MB. The limit is ${maxMb} MB.`); return;
+    }
+    setFile(picked);
+  };
+
+  const convert = async () => {
+    if (!file || busy) return;
+    setError(''); setResult(null); setStage('extracting'); setNote('Reading the PDF');
+    try {
+      const dataUrl = await new Promise<string>((resolve,reject)=>{
+        const reader = new FileReader();
+        reader.onload = ()=>resolve(String(reader.result));
+        reader.onerror = ()=>reject(new Error('That file could not be read from disk.'));
+        reader.readAsDataURL(file);
+      });
+
+      const res = await fetch('/api/documents/pdf-to-pptx', {
+        method:'POST',
+        credentials:'include',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          filename:file.name,
+          pdfBase64: dataUrl.slice(dataUrl.indexOf(',')+1),
+          theme:template,
+          useAi
+        })
+      });
+      if (!res.ok || !res.body) {
+        const detail = await res.json().catch(()=>({}));
+        throw new Error(detail.error || `The conversion failed (${res.status}).`);
+      }
+
+      // Progress is streamed as newline-delimited JSON while the work happens,
+      // so the steps below reflect the server rather than a timer.
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let finished:DeckResult|null = null;
+      for(;;){
+        const {value,done} = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value,{stream:true});
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const event = JSON.parse(line);
+          if (event.stage === 'failed') throw new Error(event.error || 'The conversion failed.');
+          if (event.message) setNote(event.message);
+          if (event.stage === 'done') { finished = event as DeckResult; setStage('done'); }
+          else setStage(event.stage === 'extracted' ? 'planning' : event.stage);
+        }
+      }
+      if (!finished) throw new Error('The conversion ended before a file was produced.');
+      setResult(finished);
+      setNote('');
+    } catch(e:any) {
+      setStage('failed'); setNote(''); setError(e.message);
+    }
+  };
+
+  const download = () => {
+    if (!result) return;
+    const blob = new Blob([base64ToBytes(result.file.base64)], {type:result.file.contentType});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url; link.download = result.file.filename;
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(()=>URL.revokeObjectURL(url), 1000);
+  };
+
+  const stepIndex = CONVERT_STEPS.findIndex(s=>s.key===stage);
+  const allDone = stage==='done';
+
+  return <div className="page">
+    <header className="page-header">
+      <div>
+        <span className="eyebrow">Documents</span>
+        <h1>Turn a PDF into editable slides.</h1>
+        <p>Headings, bullets, tables and figures come across as real PowerPoint content you can edit.</p>
+      </div>
+      <div className="header-badge"><span/><strong>PPTX</strong></div>
+    </header>
+
+    {error && <div className="page-error">{error}</div>}
+
+    <div className="content-grid">
+      <section className="card span-2">
+        <div className="card-head simple"><div>
+          <div className="card-icon"><FileUp size={17}/></div>
+          <div><h2>1 — Choose a PDF</h2><p>Up to {maxMb} MB and {limits.maxPages} pages. The text has to be selectable — a scan needs OCR first.</p></div>
+        </div></div>
+        <input ref={inputRef} type="file" accept="application/pdf,.pdf" hidden onChange={e=>choose(e.target.files?.[0])}/>
+        {!file
+          ? <button
+              className={`dropzone${dragging?' is-dragging':''}`}
+              onClick={()=>inputRef.current?.click()}
+              onDragOver={e=>{e.preventDefault(); setDragging(true)}}
+              onDragLeave={()=>setDragging(false)}
+              onDrop={e=>{e.preventDefault(); setDragging(false); choose(e.dataTransfer.files?.[0])}}>
+              <FileUp size={20}/>
+              <strong>Drop a PDF here, or click to choose</strong>
+              <span>Processed on the server and not stored afterwards.</span>
+            </button>
+          : <div className="chosen-file">
+              <span className="chosen-icon"><Presentation size={15}/></span>
+              <span className="chosen-meta"><strong>{file.name}</strong><span>{(file.size/1024).toFixed(0)} KB</span></span>
+              <button className="icon-button" title="Remove this file" disabled={busy}
+                onClick={()=>{setFile(null); setResult(null); setStage('idle'); setError(''); setNote('')}}><X size={15}/></button>
+            </div>}
+      </section>
+
+      <section className="card">
+        <div className="card-head simple"><div>
+          <div className="card-icon"><Palette size={17}/></div>
+          <div><h2>2 — Template</h2><p>Applied to every generated slide.</p></div>
+        </div></div>
+        <div className="template-grid">
+          {templates.length===0
+            ? <span className="convert-hint">Loading templates…</span>
+            : templates.map(t=>(
+                <button key={t.id} disabled={busy}
+                  className={`template-option${template===t.id?' selected':''}`}
+                  onClick={()=>setTemplate(t.id)}>
+                  <span className="swatch">{t.swatch.map((c,i)=><i key={i} style={{background:c}}/>)}</span>
+                  <span className="template-meta"><strong>{t.label}</strong><span>{t.description}</span></span>
+                  {template===t.id && <Check size={13}/>}
+                </button>
+              ))}
+        </div>
+      </section>
+
+      <section className="card">
+        <div className="card-head simple"><div>
+          <div className="card-icon"><Sparkles size={17}/></div>
+          <div><h2>3 — Structure</h2><p>How the deck gets organised.</p></div>
+        </div></div>
+        <label className="switch-row">
+          <input type="checkbox" checked={useAi} disabled={busy} onChange={e=>setUseAi(e.target.checked)}/>
+          <span className="switch" aria-hidden="true"/>
+          <span className="switch-text">
+            <strong>Use AI to organise the deck</strong>
+            <span>It groups and titles the slides. Tables and figures are copied from the PDF either way, never rewritten, so no figure can be invented.</span>
+          </span>
+        </label>
+        {!useAi && <p className="convert-hint">Slides will follow the PDF's own heading structure.</p>}
+      </section>
+
+      <section className="card span-2">
+        <div className="convert-row">
+          <button className="primary-button" disabled={!file||busy} onClick={convert}>
+            {busy ? <><LoaderCircle size={14} className="spin"/>Converting…</> : <><Presentation size={14}/>Convert to PowerPoint</>}
+          </button>
+          {!file && stage==='idle' && <span className="convert-hint">Choose a PDF to begin.</span>}
+          {note && <span className="convert-hint">{note}…</span>}
+        </div>
+        {(busy || allDone) && <ol className="stepper">
+          {CONVERT_STEPS.map((step,i)=>{
+            const done = allDone || stepIndex>i;
+            return <li key={step.key} className={done?'is-done':stepIndex===i?'is-active':''}>
+              <span className="step-dot">{done ? <Check size={11}/> : stepIndex===i ? <LoaderCircle size={11} className="spin"/> : i+1}</span>
+              <span>{step.label}</span>
+            </li>;
+          })}
+        </ol>}
+      </section>
+
+      {result && <section className="card span-2 deck-result">
+        <div className="card-head">
+          <div>
+            <div className="card-icon"><Presentation size={17}/></div>
+            <div>
+              <h2>{result.deck.title}</h2>
+              <p>{result.deck.slideCount} slides · {(result.file.bytes/1024).toFixed(0)} KB · organised by {result.deck.organisedBy==='ai'?'AI':'document structure'}</p>
+            </div>
+          </div>
+          <button className="primary-button" onClick={download}><Download size={14}/>Download PPTX</button>
+        </div>
+        <div className="deck-stats">
+          <div><strong>{result.source.pages}</strong><span>pages read{result.source.pageCount>result.source.pages?` of ${result.source.pageCount}`:''}</span></div>
+          <div><strong>{result.source.headings}</strong><span>headings found</span></div>
+          <div><strong>{result.source.tablesCarried}/{result.source.tablesFound}</strong><span>tables carried</span></div>
+          <div><strong>{result.source.imagesCarried}/{result.source.imagesFound}</strong><span>figures carried</span></div>
+        </div>
+        {result.deck.slideTitles.length>0 && <div className="slide-list">
+          {result.deck.slideTitles.map((title,i)=><span key={i}><b>{i+2}</b>{title}</span>)}
+        </div>}
+        {result.warnings.length>0 && <div className="deck-warnings">
+          <TriangleAlert size={13}/>
+          <div>{result.warnings.map((w,i)=><p key={i}>{w}</p>)}</div>
+        </div>}
+      </section>}
+    </div>
+  </div>;
+}
 
 function UsagePage() {
   const [data,setData] = useState<Usage|null>(null); const [error,setError] = useState('');
