@@ -37,6 +37,11 @@ base64. Answers render each code block with its own download control. Read the
 free-tier request ceiling in `RAILWAY_DEPLOYMENT_GUIDE.md` before putting a team
 on this.
 
+Anyone with the team access code can register from the sign-in screen, which
+asks for a username, work email, and the password twice. Three wrong passwords
+lock that address for 30 minutes; the count lives in the database rather than in
+process memory, so restarting the portal does not hand the allowance back.
+
 Run the two backing services locally with
 `docker compose -f docker-compose.local.yml up -d`.
 

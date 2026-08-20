@@ -67,6 +67,11 @@ For code work, prioritize correctness, security, maintainability and verifiable 
 const DEV_MONTHLY_BUDGET = Number(process.env.DEVELOPER_MONTHLY_BUDGET_USD || 0);
 const DEV_RPM_LIMIT = Number(process.env.DEVELOPER_RPM_LIMIT || 0);
 const DEV_TPM_LIMIT = Number(process.env.DEVELOPER_TPM_LIMIT || 0);
+// Failed sign-in policy. LOGIN_MAX_ATTEMPTS wrong passwords lock the address
+// for LOGIN_LOCKOUT_MINUTES, counted in the database rather than in memory so
+// the lockout outlives a restart.
+const LOGIN_MAX_ATTEMPTS = Math.max(1, Number(process.env.LOGIN_MAX_ATTEMPTS || 3));
+const LOGIN_LOCKOUT_MINUTES = Math.max(1, Number(process.env.LOGIN_LOCKOUT_MINUTES || 30));
 
 // Accounts that must exist on every run.
 //
@@ -164,9 +169,9 @@ app.use((_req, res, next) => {
 //
 // Anything that runs after authentication is therefore keyed on the user id.
 // Unauthenticated routes stay keyed on IP — that is what makes them useful
-// against brute force — but are sized for a shared network, and login adds a
-// second, strict per-account limit so one targeted account cannot be hammered
-// under cover of the generous network-wide allowance.
+// against brute force — but are sized for a shared network. The per-account
+// control on login is not here at all: it is a durable lockout, described
+// where it is enforced.
 const byIp = (req) => ipKeyGenerator(req.ip);
 
 // Chat: per developer. `auth` runs before this limiter, so req.user is set.
@@ -179,20 +184,14 @@ const chatLimiter = rateLimit({
   message: { error: 'You are sending messages too quickly. Wait a moment and try again.' }
 });
 
-// Login, limit 1 of 2: per account. Only failures count, so a developer
-// signing in normally never approaches it while brute force is stopped fast.
-const loginAccountLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  skipSuccessfulRequests: true,
-  keyGenerator: (req) => String(req.body?.email || '').trim().toLowerCase() || byIp(req),
-  message: { error: 'Too many failed sign-in attempts for this account. Try again in 15 minutes.' }
-});
+// Login, per account: deliberately not a rate limiter. A fixed number of tries
+// followed by a fixed cool-off is a lockout, and this store keeps its counters
+// in memory — a restart, or a Railway deploy mid-attack, would hand the
+// allowance straight back. It is enforced against jsan_login_attempts instead;
+// see LOGIN_MAX_ATTEMPTS and the login route.
 
-// Login, limit 2 of 2: per network. Sized so a full office can sign in each
-// morning, while still capping credential stuffing across many accounts.
+// Login, per network. Sized so a full office can sign in each morning, while
+// still capping credential stuffing spread across many accounts.
 const loginIpLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   limit: 300,
@@ -413,13 +412,24 @@ app.get('/api/health', async (_req, res) => {
 
 app.get('/api/auth/registration-status', (_req, res) => {
   const { count } = db.prepare('SELECT COUNT(*) AS count FROM jsan_users').get();
-  res.json({ registeredUsers: count, maxUsers: MAX_USERS, remaining: Math.max(0, MAX_USERS - count), registrationOpen: count < MAX_USERS });
+  // The sign-in policy travels with this so the form can state the rule
+  // before anyone breaks it, and name the right domain wherever it is deployed.
+  res.json({
+    registeredUsers: count,
+    maxUsers: MAX_USERS,
+    remaining: Math.max(0, MAX_USERS - count),
+    registrationOpen: count < MAX_USERS,
+    emailDomain: ALLOWED_EMAIL_DOMAIN || null,
+    maxAttempts: LOGIN_MAX_ATTEMPTS,
+    lockoutMinutes: LOGIN_LOCKOUT_MINUTES
+  });
 });
 
 app.post('/api/auth/register', registerLimiter, async (req, res) => {
   const name = String(req.body?.name || '').trim();
   const email = String(req.body?.email || '').trim().toLowerCase();
   const password = String(req.body?.password || '');
+  const confirmPassword = String(req.body?.confirmPassword || '');
   const accessCode = String(req.body?.accessCode || '');
 
   if (!safeEqual(accessCode, REGISTRATION_ACCESS_CODE)) return res.status(403).json({ error: 'The team access code is not valid' });
@@ -427,6 +437,10 @@ app.post('/api/auth/register', registerLimiter, async (req, res) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid work email' });
   if (ALLOWED_EMAIL_DOMAIN && !email.endsWith(`@${ALLOWED_EMAIL_DOMAIN}`)) return res.status(400).json({ error: `Use your ${ALLOWED_EMAIL_DOMAIN} email` });
   if (password.length < 10) return res.status(400).json({ error: 'Use at least 10 characters for your password' });
+  // Checked here as well as in the form: /api/auth/register is reachable
+  // without it, and a typo confirmed only by the browser is still a typo that
+  // locks somebody out of the account they just made.
+  if (confirmPassword !== password) return res.status(400).json({ error: 'The two passwords do not match' });
 
   // Cheap pre-checks so an obviously doomed signup never reaches LiteLLM. They
   // are advisory only; the authoritative versions run under the write lock below.
@@ -481,11 +495,102 @@ app.post('/api/auth/register', registerLimiter, async (req, res) => {
   return res.status(201).json({ user });
 });
 
-app.post('/api/auth/login', loginIpLimiter, loginAccountLimiter, async (req, res) => {
+// Failed sign-ins.
+//
+// The lockout is applied to the address that was typed, whether or not an
+// account exists behind it. Skipping unknown addresses would make them answer
+// faster and never lock, and that difference is itself an answer to "does this
+// person have an account here?".
+
+/** Human wait, for a message somebody reads while they are locked out. */
+function describeWait(seconds) {
+  const minutes = Math.ceil(seconds / 60);
+  return minutes <= 1 ? 'a minute' : `${minutes} minutes`;
+}
+
+// Rows matter only while they can still lock someone out. Pruning on write
+// keeps the table proportional to recent activity rather than to every address
+// ever typed into the form, so a stream of invented ones cannot grow it.
+function pruneLoginAttempts(now) {
+  const stamp = now.toISOString();
+  const cutoff = new Date(now.getTime() - LOGIN_LOCKOUT_MINUTES * 60_000).toISOString();
+  db.prepare('DELETE FROM jsan_login_attempts WHERE last_failed_at < ? AND (locked_until IS NULL OR locked_until < ?)')
+    .run(cutoff, stamp);
+}
+
+/** The live lockout on an address, or null when it may try again. */
+function loginLock(email, now = new Date()) {
+  const row = db.prepare('SELECT locked_until FROM jsan_login_attempts WHERE email=?').get(email);
+  if (!row?.locked_until) return null;
+  const seconds = Math.ceil((new Date(row.locked_until).getTime() - now.getTime()) / 1000);
+  return seconds > 0 ? { until: row.locked_until, seconds } : null;
+}
+
+/**
+ * Count one wrong password, and lock the address once it has used up its
+ * tries. `failures` is reset as the lock is written, so waiting a lockout out
+ * returns the full allowance rather than a single attempt.
+ */
+function recordLoginFailure(email) {
+  const now = new Date();
+  pruneLoginAttempts(now);
+  const stamp = now.toISOString();
+  const previous = db.prepare('SELECT failures FROM jsan_login_attempts WHERE email=?').get(email);
+  const failures = (previous?.failures || 0) + 1;
+
+  if (failures >= LOGIN_MAX_ATTEMPTS) {
+    const until = new Date(now.getTime() + LOGIN_LOCKOUT_MINUTES * 60_000).toISOString();
+    db.prepare(`INSERT INTO jsan_login_attempts(email,failures,locked_until,last_failed_at) VALUES(?,0,?,?)
+      ON CONFLICT(email) DO UPDATE SET failures=0, locked_until=excluded.locked_until, last_failed_at=excluded.last_failed_at`)
+      .run(email, until, stamp);
+    return { locked: true, until, seconds: LOGIN_LOCKOUT_MINUTES * 60, attemptsRemaining: 0 };
+  }
+
+  db.prepare(`INSERT INTO jsan_login_attempts(email,failures,locked_until,last_failed_at) VALUES(?,?,NULL,?)
+    ON CONFLICT(email) DO UPDATE SET failures=excluded.failures, locked_until=NULL, last_failed_at=excluded.last_failed_at`)
+    .run(email, failures, stamp);
+  return { locked: false, attemptsRemaining: LOGIN_MAX_ATTEMPTS - failures };
+}
+
+/** A correct password clears the address's history. */
+function clearLoginFailures(email) {
+  db.prepare('DELETE FROM jsan_login_attempts WHERE email=?').run(email);
+}
+
+function lockedResponse(res, { until, seconds }, error) {
+  res.setHeader('Retry-After', String(seconds));
+  return res.status(429).json({ error, lockedUntil: until, retryAfterSeconds: seconds, attemptsRemaining: 0 });
+}
+
+app.post('/api/auth/login', loginIpLimiter, async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const password = String(req.body?.password || '');
+
+  // Read before the password is checked, so a locked address costs one indexed
+  // lookup instead of a bcrypt comparison. A lockout that still spent the CPU
+  // would leave the cheapest thing to attack untouched.
+  const existingLock = loginLock(email);
+  if (existingLock) {
+    return lockedResponse(res, existingLock,
+      `Too many failed attempts. This account is locked — try again in ${describeWait(existingLock.seconds)}.`);
+  }
+
   const user = db.prepare('SELECT * FROM jsan_users WHERE email=?').get(email);
-  if (!user || !(await bcrypt.compare(password, user.password_hash))) return res.status(401).json({ error: 'Email or password is incorrect' });
+  if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+    const failure = recordLoginFailure(email);
+    if (failure.locked) {
+      return lockedResponse(res, failure,
+        `That is ${LOGIN_MAX_ATTEMPTS} incorrect attempts. This account is locked for ${LOGIN_LOCKOUT_MINUTES} minutes.`);
+    }
+    return res.status(401).json({
+      error: 'Email or password is incorrect',
+      attemptsRemaining: failure.attemptsRemaining,
+      maxAttempts: LOGIN_MAX_ATTEMPTS,
+      lockoutMinutes: LOGIN_LOCKOUT_MINUTES
+    });
+  }
+
+  clearLoginFailures(email);
   db.prepare('UPDATE jsan_users SET last_login_at=? WHERE id=?').run(nowIso(), user.id);
   setSessionCookie(res, createSession(user));
   res.json({ user: { id: user.id, name: user.name, email: user.email } });

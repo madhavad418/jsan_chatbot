@@ -6,7 +6,7 @@ import {
   ArrowUp, Check, ChevronDown, Code2, Copy, Download, Gauge, KeyRound, LogOut,
   Menu, MessageSquarePlus, Moon, Paperclip, RotateCcw, Search, Sparkles, Square,
   Sun, Terminal, Trash2, Wrench, X, Zap, BrainCircuit, Bug, GitPullRequest,
-  Blocks, BookOpenText, ShieldCheck, ExternalLink, CheckCircle2
+  Blocks, BookOpenText, ShieldCheck, ExternalLink, CheckCircle2, Lock, TriangleAlert
 } from 'lucide-react';
 import './styles.css';
 
@@ -69,6 +69,17 @@ const QUICK = [
   {icon:BookOpenText,title:'Explain code',desc:'Understand unfamiliar code quickly',text:'Explain what this code does in simple terms, then call out important dependencies, risks and opportunities to improve it.'}
 ];
 
+/** An HTTP error that keeps the body with it. The sign-in form needs the rest
+ *  of the payload - how many tries are left, when a lock lifts - and not only
+ *  the sentence meant for display. */
+class ApiError extends Error {
+  status:number; payload:any;
+  constructor(status:number, payload:any) {
+    super(payload?.error || 'Request failed');
+    this.status = status; this.payload = payload || {};
+  }
+}
+
 async function api(path:string, options:RequestInit = {}) {
   const res = await fetch(path, {
     credentials:'include',
@@ -76,7 +87,7 @@ async function api(path:string, options:RequestInit = {}) {
     headers:{ ...(options.body ? {'Content-Type':'application/json'} : {}), ...(options.headers || {}) }
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || 'Request failed');
+  if (!res.ok) throw new ApiError(res.status, data);
   return data;
 }
 
@@ -193,19 +204,113 @@ function ThemeButton(){
   return <button className="icon-button" title={dark?'Use light theme':'Use dark theme'} onClick={()=>setDark(v=>!v)}>{dark?<Sun size={15}/>:<Moon size={15}/>}</button>
 }
 
+type AlertTone = 'warn' | 'lock';
+type AuthAlertState = { tone:AlertTone; title:string; body:string } | null;
+
+/** mm:ss, for a lock the person is watching tick down. */
+function clock(totalSeconds:number) {
+  const m = Math.floor(totalSeconds / 60), s = totalSeconds % 60;
+  return `${m}:${String(s).padStart(2,'0')}`;
+}
+
+/**
+ * The popup shown when a sign-in is refused.
+ *
+ * A wrong password used to arrive as a line of red text under the form, which
+ * is easy to submit straight past - and past is the wrong direction when only
+ * three tries exist. This interrupts instead, and says what the next mistake
+ * costs.
+ */
+function AuthAlert({state,secondsLeft,onClose}:{state:AuthAlertState;secondsLeft:number;onClose:()=>void}) {
+  useEffect(()=>{
+    if(!state) return;
+    const onKey = (e:KeyboardEvent)=>{ if(e.key==='Escape') onClose(); };
+    window.addEventListener('keydown',onKey);
+    return ()=>window.removeEventListener('keydown',onKey);
+  },[state,onClose]);
+  if(!state) return null;
+  return <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal" role="alertdialog" aria-modal="true" aria-labelledby="auth-alert-title" onClick={e=>e.stopPropagation()}>
+      <div className={`modal-icon ${state.tone}`}>{state.tone==='lock'?<Lock size={19}/>:<TriangleAlert size={19}/>}</div>
+      <h3 id="auth-alert-title">{state.title}</h3>
+      <p>{state.body}</p>
+      {state.tone==='lock' && secondsLeft>0 &&
+        <div className="modal-countdown"><span>Unlocks in</span><strong>{clock(secondsLeft)}</strong></div>}
+      <button className="primary-button full" autoFocus onClick={onClose}>OK</button>
+    </div>
+  </div>;
+}
+
 function Auth({onReady}:{onReady:(u:User)=>void}) {
   const [tab,setTab] = useState<'login'|'register'>('login');
-  const [form,setForm] = useState({name:'',email:'',password:'',accessCode:''});
+  const [form,setForm] = useState({name:'',email:'',password:'',confirmPassword:'',accessCode:''});
   const [status,setStatus] = useState<any>(null);
   const [error,setError] = useState('');
   const [busy,setBusy] = useState(false);
+  const [alert,setAlert] = useState<AuthAlertState>(null);
+  // Epoch milliseconds at which the lock lifts, as the server reported it.
+  const [lockedUntil,setLockedUntil] = useState<number|null>(null);
+  const [tick,setTick] = useState(()=>Date.now());
+
   useEffect(()=>{ api('/api/auth/registration-status').then(setStatus).catch(()=>{}); },[]);
+
+  // Only run a timer while something is actually counting down.
+  useEffect(()=>{
+    if(lockedUntil===null) return;
+    const id = setInterval(()=>setTick(Date.now()),1000);
+    return ()=>clearInterval(id);
+  },[lockedUntil]);
+
+  const secondsLeft = lockedUntil===null ? 0 : Math.max(0, Math.ceil((lockedUntil-tick)/1000));
+  useEffect(()=>{ if(lockedUntil!==null && secondsLeft===0) setLockedUntil(null); },[lockedUntil,secondsLeft]);
+  const locked = secondsLeft>0;
+
+  const set = (patch:Partial<typeof form>)=>setForm(f=>({...f,...patch}));
+  const mismatch = tab==='register' && form.confirmPassword.length>0 && form.password!==form.confirmPassword;
+
   const submit = async(e:React.FormEvent)=>{
-    e.preventDefault(); setBusy(true); setError('');
-    try { const data = await api(`/api/auth/${tab}`,{method:'POST',body:JSON.stringify(form)}); onReady(data.user); }
-    catch(e:any){ setError(e.message); } finally { setBusy(false); }
+    e.preventDefault();
+    if(locked) return;
+    // Caught here so the person is told without a round trip. The server checks
+    // it again, because this form is not the only way to reach the route.
+    if(tab==='register' && form.password!==form.confirmPassword){
+      setAlert({tone:'warn',title:'Passwords do not match',body:'Type the same password into both fields, then try again.'});
+      return;
+    }
+    setBusy(true); setError('');
+    const body = tab==='login' ? { email:form.email, password:form.password } : form;
+    try {
+      const data = await api(`/api/auth/${tab}`,{method:'POST',body:JSON.stringify(body)});
+      onReady(data.user);
+    } catch(err:any) {
+      const payload = err?.payload || {};
+      if(err?.status===429 && payload.lockedUntil){
+        setLockedUntil(new Date(payload.lockedUntil).getTime());
+        setTick(Date.now());
+        setForm(f=>({...f,password:'',confirmPassword:''}));
+        setAlert({tone:'lock',title:'Account locked',body:payload.error});
+      } else if(tab==='login' && err?.status===401){
+        const left = payload.attemptsRemaining;
+        setForm(f=>({...f,password:''}));
+        setAlert({
+          tone:'warn',
+          title:'Incorrect email or password',
+          body: typeof left==='number'
+            ? `${left} ${left===1?'try':'tries'} left. After ${payload.maxAttempts ?? 3} wrong attempts this account is locked for ${payload.lockoutMinutes ?? 30} minutes.`
+            : err.message
+        });
+      } else {
+        setError(err?.message || 'Request failed');
+      }
+    } finally { setBusy(false); }
   };
+
   const canRegister = status?.registrationOpen !== false;
+  const emailDomain = status?.emailDomain;
+  const submitLabel = locked ? `Locked — ${clock(secondsLeft)}`
+    : busy ? 'Please wait…'
+    : tab==='login' ? 'Sign in' : 'Create account';
+
   return <div className="auth-screen">
     <div className="auth-glow glow-a"/><div className="auth-glow glow-b"/>
     <header className="auth-top"><Brand/><ThemeButton/></header>
@@ -231,23 +336,28 @@ function Auth({onReady}:{onReady:(u:User)=>void}) {
         </div>
         <p>{tab==='login' ? 'Continue where you left off.' : 'Use your work email and team access code.'}</p>
         <div className="auth-tabs">
-          <button className={tab==='login'?'active':''} onClick={()=>{setTab('login');setError('')}}>Sign in</button>
-          <button disabled={!canRegister} className={tab==='register'?'active':''} onClick={()=>{setTab('register');setError('')}}>Register</button>
+          <button type="button" className={tab==='login'?'active':''} onClick={()=>{setTab('login');setError('')}}>Sign in</button>
+          <button type="button" disabled={!canRegister} className={tab==='register'?'active':''} onClick={()=>{setTab('register');setError('')}}>Register</button>
         </div>
         <form onSubmit={submit}>
-          {tab==='register' && <label>Full name<input autoComplete="name" value={form.name} onChange={e=>setForm({...form,name:e.target.value})} placeholder="Your name" required/></label>}
-          <label>Work email<input autoComplete="email" type="email" value={form.email} onChange={e=>setForm({...form,email:e.target.value})} placeholder="name@jsanconsulting.com" required/></label>
-          <label>Password<input autoComplete={tab==='login'?'current-password':'new-password'} type="password" value={form.password} onChange={e=>setForm({...form,password:e.target.value})} placeholder="At least 10 characters" required/></label>
-          {tab==='register' && <label>Team access code<input value={form.accessCode} onChange={e=>setForm({...form,accessCode:e.target.value})} placeholder="Code shared by your team" required/></label>}
+          {tab==='register' && <label>Username<input autoComplete="username" value={form.name} onChange={e=>set({name:e.target.value})} placeholder="The name your team will see" required/></label>}
+          <label>Work email<input autoComplete="email" type="email" value={form.email} onChange={e=>set({email:e.target.value})} placeholder={`name@${emailDomain || 'yourcompany.com'}`} required/></label>
+          <label>Password<input autoComplete={tab==='login'?'current-password':'new-password'} type="password" value={form.password} onChange={e=>set({password:e.target.value})} placeholder="At least 10 characters" required/></label>
+          {tab==='register' && <label>Re-enter password
+            <input autoComplete="new-password" type="password" className={mismatch?'mismatch':''} value={form.confirmPassword} onChange={e=>set({confirmPassword:e.target.value})} placeholder="Type the same password again" required/>
+            {mismatch && <small className="field-hint">Both passwords must match.</small>}
+          </label>}
+          {tab==='register' && <label>Team access code<input value={form.accessCode} onChange={e=>set({accessCode:e.target.value})} placeholder="Code shared by your team" required/></label>}
           {error && <div className="form-error">{error}</div>}
-          <button className="primary-button full" disabled={busy}>{busy?'Please wait…':tab==='login'?'Sign in':'Create account'}</button>
+          {locked && <div className="form-error">Locked after {status?.maxAttempts ?? 3} failed attempts. You can try again in {clock(secondsLeft)}.</div>}
+          <button className="primary-button full" disabled={busy||locked||mismatch}>{submitLabel}</button>
         </form>
         <div className="auth-security"><ShieldCheck size={14}/><span>Provider credentials are never exposed to developer devices.</span></div>
       </section>
     </main>
+    <AuthAlert state={alert} secondsLeft={secondsLeft} onClose={()=>setAlert(null)}/>
   </div>;
 }
-
 function App() {
   const [user,setUser] = useState<User|null>(null);
   const [loading,setLoading] = useState(true);

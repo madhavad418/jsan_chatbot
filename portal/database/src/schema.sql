@@ -75,7 +75,29 @@ CREATE INDEX IF NOT EXISTS jsan_conversations_user_updated_idx
 CREATE INDEX IF NOT EXISTS jsan_messages_conversation_created_idx
   ON jsan_messages(conversation_id, created_at);
 
+-- Failed sign-in tracking, so an account lockout survives a restart.
+--
+-- express-rate-limit, which guards the rest of the unauthenticated routes,
+-- counts in memory. That is fine for smoothing bursts but wrong for a lockout:
+-- restarting the process would hand an attacker a fresh allowance, and on
+-- Railway a deploy does exactly that. This table is the durable half.
+--
+-- Keyed on the submitted email rather than a user id so an address with no
+-- account behind it is counted the same way. Were unknown addresses skipped,
+-- they would answer faster and never lock, and that difference is itself an
+-- answer to "does this person have an account here?".
+--
+-- failures resets to 0 when the lock is applied, so a developer who waits out
+-- a lockout gets the full allowance back rather than one attempt.
+CREATE TABLE IF NOT EXISTS jsan_login_attempts (
+  email          TEXT PRIMARY KEY COLLATE NOCASE,
+  failures       INTEGER NOT NULL DEFAULT 0,
+  -- ISO-8601 UTC, or NULL when the address is not locked.
+  locked_until   TEXT,
+  last_failed_at TEXT NOT NULL
+) STRICT;
+
 -- Updated rather than left alone, so a database created before the image table
 -- existed reports the version it has actually been migrated to.
-INSERT INTO jsan_schema_meta(key, value) VALUES ('schema_version', '2')
+INSERT INTO jsan_schema_meta(key, value) VALUES ('schema_version', '3')
   ON CONFLICT(key) DO UPDATE SET value = excluded.value;
